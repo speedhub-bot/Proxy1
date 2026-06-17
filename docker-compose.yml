@@ -1,0 +1,39 @@
+# ============================================================================
+#  AKAZA X PROXY — Docker Compose
+#  Usage:
+#    1.  Copy .env.example to .env and fill in BOT_TOKEN + ADMIN_ID
+#    2.  docker compose up -d --build
+#    3.  docker compose logs -f
+# ============================================================================
+services:
+  akaza-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: akaza-x-proxy:latest
+    container_name: akaza-x-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent state: users.json, working_proxies.json, audit.log, downloads, outputs
+      - ./data:/app/data
+    # Optional: resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "AKAZA_X_PROXY_Bot.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
