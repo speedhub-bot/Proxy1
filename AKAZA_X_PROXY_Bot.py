@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
 # ---------------------------------------------------------------------------
 #  CONFIG  —  Two ways to set your values:
 #
@@ -81,20 +82,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 #       Edit the four constants below directly.
 # ---------------------------------------------------------------------------
 # PUBLIC Telegram API credentials (works for any bot — no my.telegram.org needed)
-API_ID    = 611335                       # Public Telegram Desktop API ID
-API_HASH  = "d524b414d21f4d37f08684c1df41ac9c"  # Public Telegram Desktop API HASH
+API_ID    = 611335
+API_HASH  = "d524b414d21f4d37f08684c1df41ac9c"
 
-BOT_TOKEN = "your_bot_token_here"        # <-- Replace with the token from @BotFather
-ADMIN_ID  = 123456789                    # <-- Replace with your numeric Telegram user ID
+BOT_TOKEN = "your_bot_token_here"        # from @BotFather
+ADMIN_ID  = 123456789                    # from @userinfobot
+
+# Default workspace — folder called `akaza_data` next to this script.
+# Override with WORK_DIR=/some/path in .env if you want a different location.
+WORK_DIR = None
 
 
 # ---------------------------------------------------------------------------
 #  AUTO-LOAD `.env` FILE (if present)
-#  Reads BOT_TOKEN / ADMIN_ID / API_ID / API_HASH / WORK_DIR from .env
-#  without requiring you to edit this Python file.
 # ---------------------------------------------------------------------------
 def _load_dotenv():
-    """Read .env file (if it exists) and override the constants above."""
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
@@ -102,9 +104,7 @@ def _load_dotenv():
         with open(env_path, "r", encoding="utf-8") as f:
             for raw_line in f:
                 line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, value = line.partition("=")
                 key = key.strip()
@@ -112,15 +112,11 @@ def _load_dotenv():
                 if not key or not value:
                     continue
                 if key == "API_ID":
-                    try:
-                        globals()["API_ID"] = int(value)
-                    except ValueError:
-                        pass
+                    try: globals()["API_ID"] = int(value)
+                    except ValueError: pass
                 elif key == "ADMIN_ID":
-                    try:
-                        globals()["ADMIN_ID"] = int(value)
-                    except ValueError:
-                        pass
+                    try: globals()["ADMIN_ID"] = int(value)
+                    except ValueError: pass
                 elif key in ("BOT_TOKEN", "API_HASH", "WORK_DIR"):
                     globals()[key] = value
         print(f"[AKAZA] Loaded configuration from {env_path.name}")
@@ -128,6 +124,46 @@ def _load_dotenv():
         print(f"[AKAZA] WARNING: Failed to load .env file: {e}")
 
 _load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+#  BRAND CONSTANTS  —  DO NOT TOUCH
+# ---------------------------------------------------------------------------
+BRAND      = "AKAZA X PROXY"
+DEV_HANDLE = "@akaza_isnt"
+DEV_URL    = "https://t.me/akaza_isnt"
+VERSION    = "v6.3 — Fixed WORK_DIR bug"
+
+# Resolve WORK_DIR to an actual Path
+if isinstance(WORK_DIR, str) and WORK_DIR:
+    WORK_DIR = Path(WORK_DIR)
+elif isinstance(WORK_DIR, Path):
+    pass
+else:
+    # Fallback: data folder next to this script
+    WORK_DIR = Path(__file__).resolve().parent / "akaza_data"
+
+DOWNLOADS  = WORK_DIR / "downloads"
+OUTPUTS    = WORK_DIR / "outputs"
+LOG_FILE   = WORK_DIR / "akaza.log"
+USERS_FILE = WORK_DIR / "users.json"
+
+# Create workspace folders (with fallback to system temp dir on permission error)
+try:
+    for d in (WORK_DIR, DOWNLOADS, OUTPUTS):
+        d.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    print(f"[AKAZA] WARNING: Could not create {WORK_DIR}: {e}")
+    print(f"[AKAZA] Falling back to system temp dir...")
+    import tempfile
+    WORK_DIR   = Path(tempfile.gettempdir()) / "akaza_data"
+    DOWNLOADS  = WORK_DIR / "downloads"
+    OUTPUTS    = WORK_DIR / "outputs"
+    LOG_FILE   = WORK_DIR / "akaza.log"
+    USERS_FILE = WORK_DIR / "users.json"
+    for d in (WORK_DIR, DOWNLOADS, OUTPUTS):
+        d.mkdir(parents=True, exist_ok=True)
+
 
 
 # ---------------------------------------------------------------------------
