@@ -348,10 +348,17 @@ def iter_text_files_from_path(file_path: Path) -> List[Tuple[str, str]]:
 # ===========================================================================
 #  2.  PROXY EXTRACTION ENGINE  —  catches every known format
 # ===========================================================================
-IPV4_RE   = r"(?:\d{1,3}\.){3}\d{1,3}"
+# Strict IPv4: each octet is 0-255, and the whole address is bounded so it can
+# never grab a shifted window out of a longer dotted sequence such as a version
+# number ("1.2.3.4.5") or an id ("1234.5.6.7.8").  The leading (?<![\d.]) /
+# trailing (?![\d.]) guards are what prevent that class of "trash" matches.
+_OCTET_RE = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+IPV4_RE   = rf"(?<![\d.])(?:{_OCTET_RE}\.){{3}}{_OCTET_RE}(?![\d.])"
 IPV6_RE   = r"(?:[A-Fa-f0-9:]+:+)+[A-Fa-f0-9]+"           # simplified IPv6
 HOST_RE   = r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}"
-PORT_RE   = r"\d{2,5}"
+# Port: 2-5 digits, not followed by another digit so ":123456" does not silently
+# become port 12345 (which would then be reconstructed against the wrong number).
+PORT_RE   = r"\d{2,5}(?!\d)"
 USER_RE   = r"[A-Za-z0-9_\-\.]+"
 PASS_RE   = r"[A-Za-z0-9_\-\.~!\$&\*\(\)\+\=;:%@\#\?\,\/]+"
 # Expanded scheme list — covers HTTP/HTTPS/SOCKS4/SOCKS4a/SOCKS5/SOCKS5h +
@@ -2882,7 +2889,7 @@ def register_handlers(application: "Client"):
                 if len(parts) >= 4:
                     filter_kind = parts[3] if parts[3] in ("all", "banned", "approved") else "all"
                 await cb.message.edit_text(
-                    f"**{BRAND} — User List**\n\nTap a user to view details & actions:",
+                    f"**{BRAND} �� User List**\n\nTap a user to view details & actions:",
                     reply_markup=build_user_list_keyboard(page, 8, filter_kind),
                     protect_content=True,
                 )
