@@ -65,7 +65,7 @@ import tempfile
 import datetime
 import threading
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Set, Any
+from typing import List, Dict, Tuple, Optional, Set, Any, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
@@ -201,6 +201,8 @@ TEXTUAL_EXTENSIONS = {
     ".txt", ".text", ".log", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".ini", ".conf", ".cfg", ".lst", ".list", ".dat", ".srt", ".smi",
 }
+TEXT_STREAM_THRESHOLD_BYTES = 64 * 1024 * 1024  # stream files >=64MB line-by-line
+TEXT_SAMPLE_BYTES = 64 * 1024
 
 
 def _safe_read_bytes(data: bytes) -> str:
@@ -656,27 +658,16 @@ def _reconstruct_proxy(scheme: str, host: str, port: str,
     return f"{scheme}://{auth}{host}:{port}"
 
 
-def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, Any]]:
-    """
-    Scan a blob of text and return every proxy we can identify.
-    De-duplicates on (type, host, port, user, pass).
-
-    Processes line-by-line so that patterns never accidentally merge two
-    proxies that happen to sit on consecutive lines.
-
-    If `strict=True` (default), applies smart filtering to reject trash
-    like ULP URLs (https://example.com/login.php), database connection
-    strings, log entries, private IPs, and non-proxy ports.
-    """
-    seen: Set[Tuple] = set()
+def _extract_proxies_from_lines(lines: Iterable[str],
+                                strict: bool = True,
+                                seen: Optional[Set[Tuple[Any, ...]]] = None) -> List[Dict[str, Any]]:
+    """Extract proxies from an iterable of lines with de-dup support."""
+    seen_keys = seen if seen is not None else set()
     out: List[Dict[str, Any]] = []
     rejected_trash = 0
 
-    # Split into individual lines (handles \n, \r\n, \r).
-    lines = re.split(r"\r\n|\r|\n", text)
-
-    for line in lines:
-        line = line.strip()
+    for raw_line in lines:
+        line = raw_line.strip()
         if not line:
             continue
         # Skip obvious comment / noise lines
@@ -736,9 +727,9 @@ def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, 
 
             key = (proxy["type"], proxy["host"], proxy["port"],
                    proxy["username"], proxy["password"])
-            if key in seen:
+            if key in seen_keys:
                 continue
-            seen.add(key)
+            seen_keys.add(key)
             out.append(proxy)
             break  # one proxy per line is the common case
 
@@ -746,6 +737,23 @@ def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, 
         log.info(f"Smart filter rejected {rejected_trash} trash entries (URLs, log lines, non-proxy ports, etc.)")
 
     return out
+
+
+def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, Any]]:
+    """
+    Scan a blob of text and return every proxy we can identify.
+    De-duplicates on (type, host, port, user, pass).
+
+    Processes line-by-line so that patterns never accidentally merge two
+    proxies that happen to sit on consecutive lines.
+
+    If `strict=True` (default), applies smart filtering to reject trash
+    like ULP URLs (https://example.com/login.php), database connection
+    strings, log entries, private IPs, and non-proxy ports.
+    """
+    # Split into individual lines (handles \n, \r\n, \r).
+    lines = re.split(r"\r\n|\r|\n", text)
+    return _extract_proxies_from_lines(lines, strict=strict)
 
 
 def extract_proxies_from_files(file_path: Path, strict: bool = True) -> Dict[str, List[Dict[str, Any]]]:
@@ -756,6 +764,23 @@ def extract_proxies_from_files(file_path: Path, strict: bool = True) -> Dict[str
     If `strict=True` (default), applies smart filtering to reject trash.
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
+    ext = file_path.suffix.lower()
+
+    # Stream huge plain-text inputs line-by-line to avoid loading GB files in RAM.
+    if ext in TEXTUAL_EXTENSIONS or ext == "":
+        try:
+            if file_path.stat().st_size >= TEXT_STREAM_THRESHOLD_BYTES:
+                with open(file_path, "rb") as f:
+                    sample = f.read(TEXT_SAMPLE_BYTES)
+                if _is_probably_text(sample):
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        proxies = _extract_proxies_from_lines(f, strict=strict)
+                    if proxies:
+                        out[file_path.name] = proxies
+                    return out
+        except Exception as e:
+            log.warning(f"Streaming read failed {file_path.name}: {e}")
+
     for fname, text in iter_text_files_from_path(file_path):
         proxies = extract_proxies_from_text(text, strict=strict)
         if proxies:
