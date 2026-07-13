@@ -280,12 +280,19 @@ def iter_text_files_from_path(file_path: Path) -> List[Tuple[str, str]]:
         elif ext == ".7z":
             try:
                 import py7zr  # type: ignore
-                with py7zr.SevenZipFile(file_path, mode="r") as sz:
-                    for name, bio in sz.readall().items():
+                with tempfile.TemporaryDirectory(prefix="akaza_7z_") as tmp_dir:
+                    tmp_path = Path(tmp_dir)
+                    with py7zr.SevenZipFile(file_path, mode="r") as sz:
+                        sz.extractall(path=tmp_path)
+                    for extracted_file in tmp_path.rglob("*"):
+                        if not extracted_file.is_file():
+                            continue
                         try:
-                            raw = bio.read() if hasattr(bio, "read") else b""
+                            with open(extracted_file, "rb") as f:
+                                raw = f.read()
                             if _is_probably_text(raw):
-                                results.append((name, _safe_read_bytes(raw)))
+                                rel = str(extracted_file.relative_to(tmp_path))
+                                results.append((rel, _safe_read_bytes(raw)))
                         except Exception:
                             continue
             except ImportError:
@@ -1985,6 +1992,11 @@ def build_working_proxies_file(user_id: int) -> Path:
 #  5.  BOT HANDLERS  +  ACCESS CONTROL
 # ===========================================================================
 app: Optional["Client"] = None
+DOWNLOAD_WORKERS = max(8, int(os.getenv("DOWNLOAD_WORKERS", "16")))
+EXTRACT_QUEUE_WORKERS = max(1, int(os.getenv("EXTRACT_QUEUE_WORKERS", "2")))
+_EXTRACT_JOB_QUEUE: Optional[asyncio.Queue] = None
+_EXTRACT_WORKER_TASKS: List[asyncio.Task] = []
+_ADM_USERS_CB_RE = re.compile(r"^adm_users_p(?P<page>\d+)(?:_(?P<kind>all|banned|approved))?$")
 
 
 def is_admin(user_id: int) -> bool:
@@ -2033,6 +2045,50 @@ def _parse_user_id_from_command(message) -> Optional[int]:
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
     return None
+
+
+async def _extract_worker_loop():
+    """Background worker that executes blocking extraction jobs from a queue."""
+    global _EXTRACT_JOB_QUEUE
+    while True:
+        if _EXTRACT_JOB_QUEUE is None:
+            await asyncio.sleep(0.1)
+            continue
+        file_path, strict, fut = await _EXTRACT_JOB_QUEUE.get()
+        try:
+            result = await asyncio.to_thread(extract_proxies_from_files, file_path, strict)
+            if not fut.done():
+                fut.set_result(result)
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+        finally:
+            _EXTRACT_JOB_QUEUE.task_done()
+
+
+def _ensure_extract_workers():
+    """Ensure queue + worker tasks are running for extraction jobs."""
+    global _EXTRACT_JOB_QUEUE, _EXTRACT_WORKER_TASKS
+    if _EXTRACT_JOB_QUEUE is None:
+        _EXTRACT_JOB_QUEUE = asyncio.Queue()
+    _EXTRACT_WORKER_TASKS = [t for t in _EXTRACT_WORKER_TASKS if not t.done()]
+    missing = EXTRACT_QUEUE_WORKERS - len(_EXTRACT_WORKER_TASKS)
+    for _ in range(max(0, missing)):
+        _EXTRACT_WORKER_TASKS.append(asyncio.create_task(_extract_worker_loop()))
+
+
+async def submit_extract_job(file_path: Path, strict: bool = True) -> Tuple[asyncio.Future, int]:
+    """
+    Queue an extraction job and return (future, jobs_ahead).
+    `jobs_ahead` excludes currently running workers and counts waiting jobs only.
+    """
+    _ensure_extract_workers()
+    assert _EXTRACT_JOB_QUEUE is not None
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    jobs_ahead = _EXTRACT_JOB_QUEUE.qsize()
+    await _EXTRACT_JOB_QUEUE.put((file_path, strict, fut))
+    return fut, jobs_ahead
 
 
 def register_handlers(application: "Client"):
@@ -2813,6 +2869,8 @@ def register_handlers(application: "Client"):
                     f"— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_cancel_keyboard(),
                 )
+            else:
+                await cb.answer("⚠️ Unknown action button", show_alert=True)
             return
 
         # ----- Admin actions -----
@@ -2876,20 +2934,14 @@ def register_handlers(application: "Client"):
                 )
 
             elif data.startswith("adm_users_p"):
-                # Parse page + optional filter
-                parts = data.split("_")
-                # adm_users_p1_all  ->  ['adm', 'users', 'p1', 'all']
-                page = 1
-                filter_kind = "all"
-                if len(parts) >= 3:
-                    try:
-                        page = int(parts[2][1:])
-                    except Exception:
-                        page = 1
-                if len(parts) >= 4:
-                    filter_kind = parts[3] if parts[3] in ("all", "banned", "approved") else "all"
+                m = _ADM_USERS_CB_RE.match(data)
+                if not m:
+                    await cb.answer("Invalid user list callback", show_alert=True)
+                    return
+                page = int(m.group("page"))
+                filter_kind = m.group("kind") or "all"
                 await cb.message.edit_text(
-                    f"**{BRAND} �� User List**\n\nTap a user to view details & actions:",
+                    f"**{BRAND} — User List**\n\nTap a user to view details & actions:",
                     reply_markup=build_user_list_keyboard(page, 8, filter_kind),
                     protect_content=True,
                 )
@@ -3053,6 +3105,8 @@ def register_handlers(application: "Client"):
                     reply_markup=build_user_detail_keyboard(target),
                     protect_content=True,
                 )
+            else:
+                await cb.answer("⚠️ Unknown admin button", show_alert=True)
             return
 
     # ---------------------- Document handler ----------------------
@@ -3147,7 +3201,29 @@ def register_handlers(application: "Client"):
 
         extract_start = time.time()
         try:
-            per_file = extract_proxies_from_files(local_path, strict=STRICT_MODE)
+            extract_future, jobs_ahead = await submit_extract_job(local_path, strict=STRICT_MODE)
+            spinner = ("⏳", "⌛", "🔄")
+            spin_idx = 0
+            while not extract_future.done():
+                queue_hint = (
+                    f"🧵 Queue: `{jobs_ahead}` ahead\n"
+                    if jobs_ahead > 0 else
+                    "🧵 Queue: processing now\n"
+                )
+                try:
+                    await status_msg.edit_text(
+                        f"**{BRAND} — Extracting**\n\n"
+                        f"📥 File: `{fname}`\n"
+                        f"✅ Download: `{dl_elapsed:.1f}s` (`{dl_speed:.2f} MB/s`)\n"
+                        f"{queue_hint}"
+                        f"🔎 Extracting proxies... {spinner[spin_idx % len(spinner)]}\n\n"
+                        f"— Credit: **{DEV_HANDLE}**"
+                    )
+                except Exception:
+                    pass
+                spin_idx += 1
+                await asyncio.sleep(1.25)
+            per_file = await extract_future
         except Exception as e:
             await status_msg.edit_text(f"❌ Extract failed: `{e}`")
             return
@@ -3446,7 +3522,7 @@ def register_handlers(application: "Client"):
 
         text = message.text or ""
         extract_start = time.time()
-        proxies = extract_proxies_from_text(text, strict=STRICT_MODE)
+        proxies = await asyncio.to_thread(extract_proxies_from_text, text, STRICT_MODE)
         extract_elapsed = time.time() - extract_start
 
         if not proxies:
@@ -3645,9 +3721,9 @@ def main():
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
         workdir=str(WORK_DIR),
-        # MTProto parallel chunk download — 16 workers handle GB-sized files
-        # in parallel chunks (default is 4).  Increase for faster throughput.
-        workers=16,
+        # MTProto parallel chunk download workers (default 16, min 8).
+        # Can be overridden via DOWNLOAD_WORKERS in .env.
+        workers=DOWNLOAD_WORKERS,
     )
     register_handlers(client)
 
