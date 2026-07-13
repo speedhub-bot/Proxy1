@@ -53,6 +53,7 @@ import os
 import re
 import io
 import sys
+import ipaddress
 import time
 import json
 import zipfile
@@ -493,7 +494,29 @@ PROXY_PATTERNS: List[str] = [
 ]
 
 # Pre-compile for speed
-_COMPILED_PATTERNS = [re.compile(p) for p in PROXY_PATTERNS]
+_COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in PROXY_PATTERNS]
+
+# Canonical full-line formats. The legacy patterns above remain for
+# compatibility, but extraction uses this stricter ordered set.
+_HOST_TOKEN = rf"(?:{IPV4_RE}|{HOST_RE})"
+_AUTH_TOKEN = rf"(?:(?P<user>{USER_RE}):(?P<password>{PASS_RE})@)?"
+PROXY_PATTERNS = [
+    rf"^(?P<scheme>{SCHEME_RE})://{_AUTH_TOKEN}(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
+    rf"^(?P<user>{USER_RE}):(?P<password>{PASS_RE})@(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
+    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE}):(?P<user>{USER_RE}):(?P<password>{PASS_RE})$",
+    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE})\|(?P<user>[^|\s]+)\|(?P<password>[^|\s]+)$",
+    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE});(?P<user>[^;\s]+);(?P<password>[^;\s]+)$",
+    rf"^(?P<host>{_HOST_TOKEN})\|(?P<port>{PORT_RE})$",
+    rf"^(?P<host>{_HOST_TOKEN}),(?P<port>{PORT_RE})(?:,(?P<user>[^,\s]+),(?P<password>[^,\s]+))?$",
+    rf"^(?P<host>{_HOST_TOKEN})\t(?P<port>{PORT_RE})(?:\t(?P<user>[^\t\s]+)\t(?P<password>[^\t\s]+))?$",
+    rf"^(?P<host>{_HOST_TOKEN})\s+(?P<port>{PORT_RE})(?:\s+(?P<user>\S+)\s+(?P<password>\S+))?$",
+    rf"^\[(?P<host>{IPV6_RE})\]:(?P<port>{PORT_RE})$",
+    rf"^\[(?P<host>{_HOST_TOKEN})\]:(?P<port>{PORT_RE})$",
+    rf"^(?P<scheme>https?|socks[45][ha]?)\s+(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
+    rf"^(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE}):(?P<scheme>https?|socks[45][ha]?)$",
+    rf"^(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
+]
+_COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in PROXY_PATTERNS]
 
 # Global strict-mode flag — admin can toggle via /strict and /lenient commands.
 # When True (default), the bot rejects trash like ULP URLs, log entries,
@@ -531,6 +554,7 @@ COMMON_PROXY_PORTS = {
     # Common alt ranges
     8000, 8001, 8008, 8089, 8181, 8223, 8444, 8445, 8530, 8889, 9000, 9001,
 }
+BARE_PROXY_PORTS = COMMON_PROXY_PORTS - {80, 443}
 
 # Reserved / private IP ranges that are almost never public proxies
 # (we still allow them, but flag as suspicious)
@@ -568,7 +592,8 @@ def _is_private_ip(ip: str) -> bool:
     return ip.startswith(PRIVATE_IP_PREFIXES)
 
 
-def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int) -> bool:
+def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int,
+                           explicit_scheme: bool = False) -> bool:
     """
     Smart context filter — returns True if this line REALLY looks like a proxy.
 
@@ -583,11 +608,11 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int) -> bool
     line_stripped = line.strip()
 
     # 1. SOCKS schemes — always accept (these are ALWAYS proxies, never websites)
-    if scheme and scheme.startswith("socks"):
+    if explicit_scheme and scheme.startswith("socks"):
         return True
 
     # 2. http:// or https:// URLs — must NOT have a path/query to be a proxy
-    if scheme in ("http", "https") and "://" in line_lower:
+    if explicit_scheme and scheme in ("http", "https") and "://" in line_lower:
         # It's a URL — must NOT have a path/query to be a proxy
         after_scheme = line_lower.split("://", 1)[1] if "://" in line_lower else ""
         if "@" in after_scheme:
@@ -616,7 +641,7 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int) -> bool
         return True
 
     # 3. Non-proxy schemes (ftp, ssh, quic, ssl, connect, proxy)
-    if scheme and scheme not in ("http", "https", ""):
+    if explicit_scheme and scheme not in ("http", "https", ""):
         # Accept only on common proxy ports
         return port in COMMON_PROXY_PORTS
 
@@ -637,7 +662,7 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int) -> bool
         return False
 
     # Must be on a common proxy port
-    if port not in COMMON_PROXY_PORTS:
+    if port not in BARE_PROXY_PORTS:
         return False
 
     # Reject if the line has too many words (looks like a log entry)
@@ -664,7 +689,8 @@ def _classify_proxy(scheme: str, host: str, port: str,
     """Build a normalized proxy dict or None if invalid."""
     if not _valid_port(port):
         return None
-    if not (_valid_ipv4(host) or re.match(rf"^{HOST_RE}$", host)):
+    if not (_valid_ipv4(host) or _valid_ipv6(host)
+            or re.match(rf"^{HOST_RE}$", host)):
         return None
 
     scheme = (scheme or "").lower()
@@ -691,10 +717,19 @@ def _classify_proxy(scheme: str, host: str, port: str,
     return proxy
 
 
+def _valid_ipv6(host: str) -> bool:
+    try:
+        ipaddress.IPv6Address(host)
+        return True
+    except Exception:
+        return False
+
+
 def _reconstruct_proxy(scheme: str, host: str, port: str,
                        user: Optional[str], pwd: Optional[str]) -> str:
     auth = f"{user}:{pwd}@" if user and pwd else ""
-    return f"{scheme}://{auth}{host}:{port}"
+    host_text = f"[{host}]" if _valid_ipv6(host) else host
+    return f"{scheme}://{auth}{host_text}:{port}"
 
 
 def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = True,
@@ -707,49 +742,30 @@ def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = Tru
     rejected_trash = 0
 
     for line in lines_iterable:
-        line = line.strip()
-        if not line:
+        candidate = line.strip()
+        if not candidate:
             continue
-        # Skip obvious comment / noise lines
-        if line.startswith("#") or line.startswith("//"):
+        candidate = re.sub(r"^(?:[-*+])\s+", "", candidate)
+        candidate = re.sub(r"\s+#.*$", "", candidate).strip()
+        if len(candidate) >= 2 and candidate[0] in "\"'" and candidate[-1] == candidate[0]:
+            candidate = candidate[1:-1].strip()
+        elif candidate.startswith("[") and candidate.endswith("]") and candidate.count(":") == 1:
+            candidate = candidate[1:-1].strip()
+        if not candidate:
             continue
-        # Skip JSON / XML / log markers
-        if line.startswith(("{", "<", "[")) and not line.startswith(("[http", "[socks")):
-            # Could be JSON or XML — skip unless it clearly starts with a proxy URL
-            if not any(line.lower().startswith(p) for p in
-                       ("http://", "https://", "socks4://", "socks5://",
-                        "socks4a://", "socks5h://", "quic://", "ssl://")):
-                continue
 
-        # Try each pattern in priority order; first match on this line wins.
+        # Every accepted token must span the complete normalized line.
         for pat in _COMPILED_PATTERNS:
-            m = pat.search(line)
+            m = pat.fullmatch(candidate)
             if not m:
                 continue
 
             g = m.groupdict()
-            # Scheme may come from any of: scheme, scheme2, scheme3, scheme4
-            scheme = (g.get("scheme") or g.get("scheme2") or
-                      g.get("scheme3") or g.get("scheme4") or "").lower()
-            # Host may come from any pattern's hN group
-            host   = (g.get("h1")  or g.get("h2")  or g.get("h3")  or g.get("h4")
-                   or g.get("h5")  or g.get("h6")  or g.get("h7")  or g.get("h8")
-                   or g.get("h9")  or g.get("h10") or g.get("h11") or g.get("h12")
-                   or g.get("h13") or g.get("h14") or g.get("h15") or g.get("h16")
-                   or g.get("h17") or g.get("h18") or g.get("h19") or g.get("h20")
-                   or g.get("h21") or "")
-            port   = (g.get("port1")  or g.get("port2")  or g.get("port3")  or g.get("port4")
-                   or g.get("port5")  or g.get("port6")  or g.get("port7")  or g.get("port8")
-                   or g.get("port9")  or g.get("port10") or g.get("port11") or g.get("port12")
-                   or g.get("port13") or g.get("port14") or g.get("port15") or g.get("port16")
-                   or g.get("port17") or g.get("port18") or g.get("port19") or g.get("port20")
-                   or g.get("port21") or "")
-            user   = (g.get("u1")  or g.get("u2")  or g.get("u3")  or g.get("u4")
-                   or g.get("u5")  or g.get("u6")  or g.get("u9")  or g.get("u10")
-                   or g.get("u18") or "")
-            pwd    = (g.get("p1")  or g.get("p2")  or g.get("p3")  or g.get("p4")
-                   or g.get("p5")  or g.get("p6")  or g.get("p9")  or g.get("p10")
-                   or g.get("p18") or "")
+            scheme = (g.get("scheme") or "").lower()
+            host = g.get("host") or ""
+            port = g.get("port") or ""
+            user = g.get("user") or ""
+            pwd = g.get("password") or ""
 
             proxy = _classify_proxy(scheme, host, port, user, pwd)
             if not proxy:
@@ -761,7 +777,10 @@ def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = Tru
                     port_int = int(proxy["port"])
                 except Exception:
                     port_int = 0
-                if not _looks_like_proxy_line(line, proxy.get("scheme", ""), host, port_int):
+                if not _looks_like_proxy_line(
+                    candidate, proxy.get("scheme", ""), host, port_int,
+                    explicit_scheme=bool(scheme),
+                ):
                     rejected_trash += 1
                     continue  # try next pattern on this line
 
@@ -793,6 +812,46 @@ def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, 
     """
     lines = re.split(r"\r\n|\r|\n", text)
     return list(extract_proxies_from_lines(lines, strict=strict))
+
+
+def run_filter_selftest() -> bool:
+    """Validate canonical positive formats and ULP rejection samples."""
+    positive = [
+        "1.2.3.4:8080",
+        "socks5://1.2.3.4:1080",
+        "user:pass@1.2.3.4:3128",
+        "1.2.3.4:8080:user:pass",
+        "1.2.3.4|8080",
+        "1.2.3.4,8080,user,pass",
+        "1.2.3.4\t8080\tuser\tpass",
+        "HTTP 1.2.3.4:8080",
+        "1.2.3.4:8080:socks5",
+    ]
+    negative = [
+        "https://site.com/login.php:user:pass",
+        "example.com:443",
+        "1.2.3.4:443",
+        "[error] GET /x 1.2.3.4:80",
+        '{"proxy": "1.2.3.4:8080"}',
+        "email@x.com:password",
+    ]
+    failures = []
+    for sample in positive:
+        if not extract_proxies_from_text(sample):
+            failures.append(f"positive rejected: {sample}")
+    for sample in negative:
+        if extract_proxies_from_text(sample):
+            failures.append(f"negative accepted: {sample}")
+    if failures:
+        print("FILTER SELFTEST: FAIL")
+        for failure in failures:
+            print(f"  - {failure}")
+        return False
+    print(
+        f"FILTER SELFTEST: PASS ({len(positive)} positive, "
+        f"{len(negative)} negative)"
+    )
+    return True
 
 
 def extract_proxies_from_files(file_path: Path, strict: bool = True) -> Dict[str, List[Dict[str, Any]]]:
@@ -830,6 +889,7 @@ VERIFY_TIMEOUT = 8          # seconds per proxy
 VERIFY_URL     = "http://httpbin.org/ip"   # lightweight endpoint
 VERIFY_URL_HTTPS = "https://httpbin.org/ip"
 VERIFY_THREADS = 60          # parallel workers
+MY_PUBLIC_IP: Optional[str] = None
 
 try:
     import requests
@@ -849,8 +909,54 @@ def _build_proxies_dict(proxy: Dict[str, Any]) -> Dict[str, str]:
     auth = ""
     if proxy["username"] and proxy["password"]:
         auth = f"{proxy['username']}:{proxy['password']}@"
-    url = f"{proxy['scheme']}://{auth}{proxy['host']}:{proxy['port']}"
+    scheme = proxy["scheme"].lower()
+    if scheme.startswith("socks5"):
+        scheme = "socks5h"
+    elif scheme.startswith("socks4"):
+        scheme = "socks4a"
+    host = f"[{proxy['host']}]" if _valid_ipv6(proxy["host"]) else proxy["host"]
+    url = f"{scheme}://{auth}{host}:{proxy['port']}"
     return {"http": url, "https": url}
+
+
+def _parse_echo_ip(payload: Any, key: str) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return None
+    candidate = value.split(",", 1)[0].strip()
+    return candidate if _valid_ipv4(candidate) else None
+
+
+def detect_public_ip() -> Optional[str]:
+    """Detect and cache this host's direct public IPv4 address."""
+    global MY_PUBLIC_IP
+    if MY_PUBLIC_IP is not None:
+        return MY_PUBLIC_IP
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        response = requests.get(
+            VERIFY_URL, timeout=min(VERIFY_TIMEOUT, 4),
+            allow_redirects=False,
+        )
+        if response.status_code == 200:
+            MY_PUBLIC_IP = _parse_echo_ip(response.json(), "origin")
+    except Exception:
+        pass
+    if MY_PUBLIC_IP is None:
+        try:
+            response = requests.get(
+                "https://api.ipify.org?format=json",
+                timeout=min(VERIFY_TIMEOUT, 4),
+                allow_redirects=False,
+            )
+            if response.status_code == 200:
+                MY_PUBLIC_IP = _parse_echo_ip(response.json(), "ip")
+        except Exception:
+            pass
+    return MY_PUBLIC_IP
 
 
 def verify_one_proxy(proxy: Dict[str, Any]) -> Dict[str, Any]:
@@ -871,38 +977,43 @@ def verify_one_proxy(proxy: Dict[str, Any]) -> Dict[str, Any]:
 
     proxies = _build_proxies_dict(proxy)
     start = time.time()
-    try:
-        # Try HTTPS first then HTTP fallback
-        url = VERIFY_URL_HTTPS if proxy["scheme"] in ("https",) else VERIFY_URL
-        r = requests.get(url, proxies=proxies, timeout=VERIFY_TIMEOUT,
-                         verify=False, allow_redirects=True)
-        if 200 <= r.status_code < 400:
-            result["working"]    = True
-            result["latency_ms"] = int((time.time() - start) * 1000)
-        else:
-            result["error"] = f"HTTP {r.status_code}"
-    except requests.exceptions.ProxyError as e:
-        result["error"] = "proxy error"
-    except requests.exceptions.ConnectTimeout:
-        result["error"] = "connect timeout"
-    except requests.exceptions.ReadTimeout:
-        result["error"] = "read timeout"
-    except requests.exceptions.ConnectionError:
-        result["error"] = "connection refused"
-    except requests.exceptions.SSLError:
-        # retry over http
+    last_error = None
+    for url, key in ((VERIFY_URL, "origin"),
+                     ("https://api.ipify.org?format=json", "ip")):
         try:
-            r = requests.get(VERIFY_URL, proxies=proxies, timeout=VERIFY_TIMEOUT,
-                             verify=False, allow_redirects=True)
-            if 200 <= r.status_code < 400:
-                result["working"]    = True
-                result["latency_ms"] = int((time.time() - start) * 1000)
-            else:
-                result["error"] = f"HTTP {r.status_code}"
-        except Exception as e2:
-            result["error"] = "ssl+http fail"
-    except Exception as e:
-        result["error"] = type(e).__name__
+            response = requests.get(
+                url, proxies=proxies, timeout=VERIFY_TIMEOUT,
+                verify=False, allow_redirects=False,
+            )
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                remote_ip = _parse_echo_ip(response.json(), key)
+            except Exception:
+                remote_ip = None
+            if remote_ip is None:
+                last_error = "bad-body"
+                continue
+            if MY_PUBLIC_IP and remote_ip == MY_PUBLIC_IP:
+                result["error"] = "bypass/no-relay"
+                return result
+            result["working"] = True
+            result["latency_ms"] = int((time.time() - start) * 1000)
+            return result
+        except requests.exceptions.ProxyError:
+            last_error = "proxy error"
+        except requests.exceptions.ConnectTimeout:
+            last_error = "connect timeout"
+        except requests.exceptions.ReadTimeout:
+            last_error = "read timeout"
+        except requests.exceptions.ConnectionError:
+            last_error = "connection refused"
+        except requests.exceptions.SSLError:
+            last_error = "ssl error"
+        except Exception as e:
+            last_error = type(e).__name__
+    result["error"] = last_error or "bypass/no-relay"
     return result
 
 
@@ -911,6 +1022,7 @@ def verify_proxies_batch(proxies: List[Dict[str, Any]],
     """Verify a list of proxies in parallel. Returns augmented list."""
     if not proxies:
         return []
+    detect_public_ip()
     results: List[Dict[str, Any]] = [None] * len(proxies)   # type: ignore
 
     with ThreadPoolExecutor(max_workers=VERIFY_THREADS) as ex:
@@ -947,6 +1059,7 @@ def verify_proxies_streaming(proxies: List[Dict[str, Any]],
     """
     if not proxies:
         return []
+    detect_public_ip()
     results: List[Dict[str, Any]] = []
     total = len(proxies)
 
@@ -1007,7 +1120,9 @@ def verify_proxies_streaming(proxies: List[Dict[str, Any]],
 #  4.  TELEGRAM BOT  —  Pyrogram-based with dashboard UI
 # ===========================================================================
 try:
-    from pyrogram import Client, filters
+    from pyrogram import Client, filters, raw
+    from pyrogram.file_id import FileId, FileType
+    from pyrogram.session import Auth, Session
     from pyrogram.errors import MessageNotModified
     from pyrogram.types import (
         Message, CallbackQuery, InlineKeyboardMarkup,
@@ -1018,6 +1133,160 @@ try:
 except Exception:
     PYROGRAM_AVAILABLE = False
     MessageNotModified = type("MessageNotModified", (Exception,), {})
+    raw = FileId = FileType = Auth = Session = None
+
+PYROGRAM_PARALLEL_SESSIONS = max(
+    1, int(os.getenv("PYROGRAM_PARALLEL_SESSIONS", "4"))
+)
+PYROGRAM_PARALLEL_PER_SESSION = max(
+    1, int(os.getenv("PYROGRAM_PARALLEL_PER_SESSION", "4"))
+)
+CHUNK_SIZE = 1024 * 1024
+PYROGRAM_SLEEP_THRESHOLD = max(
+    0, int(os.getenv("PYROGRAM_SLEEP_THRESHOLD", "60"))
+)
+
+
+async def _open_media_session(client: "Client", dc_id: int):
+    """Open a media session for parallel upload.GetFile requests."""
+    home_dc = await client.storage.dc_id()
+    test_mode = await client.storage.test_mode()
+    if dc_id == home_dc:
+        auth_key = await client.storage.auth_key()
+    else:
+        auth_key = await Auth(client, dc_id, test_mode).create()
+    session = Session(client, dc_id, auth_key, test_mode, is_media=True)
+    await session.start()
+    if dc_id != home_dc:
+        exported = await client.invoke(
+            raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+        )
+        await session.invoke(
+            raw.functions.auth.ImportAuthorization(
+                id=exported.id, bytes=exported.bytes
+            )
+        )
+    return session
+
+
+async def _parallel_download(client, message, out_path: str, file_size: int,
+                             progress_cb=None, cancel_cb=None) -> str:
+    """Download document chunks concurrently across media sessions."""
+    if raw is None or FileId is None:
+        raise NotImplementedError("Pyrogram raw media API unavailable")
+    media = message.document or getattr(message, "video", None)
+    if media is None:
+        raise NotImplementedError("message has no document media")
+    file_id = FileId.decode(media.file_id)
+    supported = (
+        FileType.DOCUMENT, FileType.VIDEO, FileType.AUDIO,
+        FileType.ANIMATION, FileType.VOICE, FileType.VIDEO_NOTE,
+    )
+    if file_id.file_type not in supported:
+        raise NotImplementedError("unsupported media type")
+
+    location = raw.types.InputDocumentFileLocation(
+        id=file_id.media_id,
+        access_hash=file_id.access_hash,
+        file_reference=file_id.file_reference,
+        thumb_size=file_id.thumbnail_size or "",
+    )
+    total_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "wb") as fh:
+        fh.truncate(file_size)
+    fd = os.open(out_path, os.O_WRONLY)
+    sessions = []
+    next_idx = 0
+    downloaded = 0
+    last_progress = 0
+    idx_lock = asyncio.Lock()
+    write_lock = asyncio.Lock()
+
+    async def next_chunk():
+        nonlocal next_idx
+        async with idx_lock:
+            if next_idx >= total_chunks:
+                return None
+            idx = next_idx
+            next_idx += 1
+            return idx
+
+    async def fetch(session, offset):
+        try:
+            from pyrogram.errors import FloodWait
+        except Exception:
+            FloodWait = ()  # type: ignore
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                response = await session.invoke(
+                    raw.functions.upload.GetFile(
+                        location=location, offset=offset, limit=CHUNK_SIZE
+                    ),
+                    sleep_threshold=PYROGRAM_SLEEP_THRESHOLD,
+                )
+            except Exception as exc:
+                if FloodWait and isinstance(exc, FloodWait) and attempts < 5:
+                    await asyncio.sleep(float(getattr(exc, "value", 5)))
+                    continue
+                raise
+            if isinstance(response, raw.types.upload.FileCdnRedirect):
+                raise NotImplementedError("CDN redirect")
+            if not isinstance(response, raw.types.upload.File):
+                raise RuntimeError(
+                    f"unexpected GetFile response: {type(response).__name__}"
+                )
+            return response.bytes
+
+    async def worker(session):
+        nonlocal downloaded, last_progress
+        while True:
+            if cancel_cb is not None and cancel_cb():
+                return
+            idx = await next_chunk()
+            if idx is None:
+                return
+            chunk = await fetch(session, idx * CHUNK_SIZE)
+            async with write_lock:
+                os.pwrite(fd, chunk, idx * CHUNK_SIZE)
+                downloaded += len(chunk)
+                if progress_cb is not None and (
+                    downloaded - last_progress >= 2 * CHUNK_SIZE
+                    or downloaded >= file_size
+                ):
+                    last_progress = downloaded
+                    await progress_cb(downloaded, file_size)
+
+    try:
+        file_id_dc = file_id.dc_id
+        for _ in range(PYROGRAM_PARALLEL_SESSIONS):
+            sessions.append(await _open_media_session(client, file_id_dc))
+        tasks = [
+            asyncio.create_task(worker(session))
+            for session in sessions
+            for _ in range(PYROGRAM_PARALLEL_PER_SESSION)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            raise
+    finally:
+        os.close(fd)
+        for session in sessions:
+            try:
+                await session.stop()
+            except Exception:
+                pass
+    if file_size and os.path.getsize(out_path) != file_size:
+        raise RuntimeError(
+            f"Incomplete download: got {os.path.getsize(out_path):,} "
+            f"of {file_size:,} bytes"
+        )
+    return out_path
 
 
 # ---- Branding strings -----------------------------------------------------
@@ -3325,7 +3594,8 @@ def register_handlers(application: "Client"):
             f"**{BRAND}**\n\n"
             f"📥 File: `{fname}`\n"
             f"{size_str}\n"
-            f"⏳ Downloading via MTProto ({DOWNLOAD_WORKERS} workers)...\n\n"
+            f"⏳ Downloading via parallel chunked MTProto "
+            f"({PYROGRAM_PARALLEL_SESSIONS}×{PYROGRAM_PARALLEL_PER_SESSION})...\n\n"
             f"— Credit: **{DEV_HANDLE}**"
         )
 
@@ -3360,11 +3630,34 @@ def register_handlers(application: "Client"):
                 pass  # Telegram rate-limit — ignore
 
         try:
-            await client.download_media(
-                message=message,
-                file_name=str(local_path),
-                progress=_dl_progress,
-            )
+            # The parallel chunk downloader needs a known file size to
+            # partition the file; without it we cannot detect a short
+            # read, so fall back to the sequential downloader.
+            used_parallel = False
+            if file_size and file_size > 0:
+                try:
+                    await _parallel_download(
+                        client, message, str(local_path), file_size,
+                        progress_cb=_dl_progress,
+                        cancel_cb=lambda: False,
+                    )
+                    used_parallel = True
+                except Exception as parallel_error:
+                    log.warning(
+                        f"Parallel download unavailable/failed; falling back: "
+                        f"{parallel_error}"
+                    )
+            if not used_parallel:
+                await client.download_media(
+                    message=message,
+                    file_name=str(local_path),
+                    progress=_dl_progress,
+                )
+            if file_size and local_path.stat().st_size != file_size:
+                raise RuntimeError(
+                    f"Downloaded file size mismatch: "
+                    f"{local_path.stat().st_size} != {file_size}"
+                )
         except Exception as e:
             try:
                 local_path.unlink(missing_ok=True)
@@ -3904,6 +4197,8 @@ def _validate_config():
 
 
 def main():
+    if "--selftest" in sys.argv:
+        sys.exit(0 if run_filter_selftest() else 1)
     print(BANNER)
     problems = _validate_config()
     if problems:
