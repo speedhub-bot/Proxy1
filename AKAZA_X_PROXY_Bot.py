@@ -65,8 +65,8 @@ import tempfile
 import datetime
 import threading
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Set, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional, Set, Any, Iterator, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 # ---------------------------------------------------------------------------
 #  CONFIG  —  Two ways to set your values:
@@ -115,6 +115,7 @@ def _load_dotenv():
                 value = value.strip().strip('"').strip("'")
                 if not key or not value:
                     continue
+                os.environ[key] = value
                 if key == "API_ID":
                     try:
                         globals()["API_ID"] = int(value)
@@ -141,6 +142,12 @@ BRAND      = "AKAZA X PROXY"
 DEV_HANDLE = "@akaza_isnt"
 DEV_URL    = "https://t.me/akaza_isnt"
 VERSION    = "v7.0 — Smart filter + button fix"
+PROCESS_START_TIME = time.time()
+
+# Resource limits — can be overridden through .env or the process environment.
+EXTRACT_MAX_PROXIES = max(1000, int(os.getenv("EXTRACT_MAX_PROXIES", "1000000")))
+VERIFY_MAX_PROXIES  = max(100, int(os.getenv("VERIFY_MAX_PROXIES", "50000")))
+MAX_FILE_SIZE_MB    = max(1, int(os.getenv("MAX_FILE_SIZE_MB", "2048")))
 # Workspace: a folder called `akaza_data` next to this script.
 # Can be overridden via WORK_DIR=... in .env
 if isinstance(WORK_DIR, str) and WORK_DIR:
@@ -222,134 +229,168 @@ def _is_probably_text(data: bytes) -> bool:
     return nul < 8
 
 
-def iter_text_files_from_path(file_path: Path) -> List[Tuple[str, str]]:
-    """
-    Walk through a single file or archive and yield (filename, text-content)
-    for every textual file found inside.
-    """
-    results: List[Tuple[str, str]] = []
+class _PrefixedBinaryReader:
+    """Expose a consumed prefix before continuing with the original stream."""
+
+    def __init__(self, prefix: bytes, stream):
+        self._prefix = io.BytesIO(prefix)
+        self._stream = stream
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return bool(getattr(self._stream, "closed", False))
+
+    def read(self, size: int = -1):
+        if size is None or size < 0:
+            return self._prefix.read() + self._stream.read()
+        prefix = self._prefix.read(size)
+        if len(prefix) < size:
+            prefix += self._stream.read(size - len(prefix))
+        return prefix
+
+
+def _stream_binary_lines(binary_fileobj, source_name: str) -> Iterator[Tuple[str, str]]:
+    """Yield decoded lines from a binary stream without loading it all."""
+    try:
+        peek = binary_fileobj.read(4096)
+        if not _is_probably_text(peek):
+            return
+        stream = _PrefixedBinaryReader(peek, binary_fileobj)
+        text_stream = io.TextIOWrapper(stream, encoding="utf-8", errors="ignore")
+        for line in text_stream:
+            yield source_name, line
+    except Exception as e:
+        log.warning(f"Failed streaming {source_name}: {e}")
+
+
+def iter_text_lines_from_path(file_path: Path) -> Iterator[Tuple[str, str]]:
+    """Stream (source filename, line) pairs from a file or supported archive."""
     ext = file_path.suffix.lower()
 
-    try:
-        if ext in TEXTUAL_EXTENSIONS or ext == "":
-            try:
-                with open(file_path, "rb") as f:
-                    raw = f.read()
-                if _is_probably_text(raw):
-                    results.append((file_path.name, _safe_read_bytes(raw)))
-            except Exception as e:
-                log.warning(f"Failed reading {file_path.name}: {e}")
+    if ext in TEXTUAL_EXTENSIONS or ext == "":
+        try:
+            with open(file_path, "rb") as f:
+                yield from _stream_binary_lines(f, file_path.name)
+        except Exception as e:
+            log.warning(f"Failed reading {file_path.name}: {e}")
+        return
 
-        elif ext == ".zip":
-            try:
-                with zipfile.ZipFile(file_path, "r") as zf:
-                    for member in zf.namelist():
-                        if member.endswith("/"):
-                            continue
-                        try:
-                            raw = zf.read(member)
-                            if _is_probably_text(raw):
-                                results.append((member, _safe_read_bytes(raw)))
-                        except Exception:
-                            continue
-            except Exception as e:
-                log.warning(f"ZIP read failed {file_path.name}: {e}")
-
-        elif ext == ".rar":
-            try:
-                import rarfile  # type: ignore
-                try:
-                    rarfile.UNRAR_TOOL = "unrar"
-                except Exception:
-                    pass
-                with rarfile.RarFile(file_path, "r") as rf:
-                    for member in rf.namelist():
-                        if member.endswith("/"):
-                            continue
-                        try:
-                            raw = rf.read(member)
-                            if _is_probably_text(raw):
-                                results.append((member, _safe_read_bytes(raw)))
-                        except Exception:
-                            continue
-            except ImportError:
-                log.warning("rarfile not installed — skipping .rar contents")
-            except Exception as e:
-                log.warning(f"RAR read failed {file_path.name}: {e}")
-
-        elif ext == ".7z":
-            try:
-                import py7zr  # type: ignore
-                with tempfile.TemporaryDirectory(prefix="akaza_7z_") as tmp_dir:
-                    tmp_path = Path(tmp_dir)
-                    with py7zr.SevenZipFile(file_path, mode="r") as sz:
-                        sz.extractall(path=tmp_path)
-                    for extracted_file in tmp_path.rglob("*"):
-                        if not extracted_file.is_file():
-                            continue
-                        try:
-                            with open(extracted_file, "rb") as f:
-                                raw = f.read()
-                            if _is_probably_text(raw):
-                                rel = str(extracted_file.relative_to(tmp_path))
-                                results.append((rel, _safe_read_bytes(raw)))
-                        except Exception:
-                            continue
-            except ImportError:
-                log.warning("py7zr not installed — skipping .7z contents")
-            except Exception as e:
-                log.warning(f"7z read failed {file_path.name}: {e}")
-
-        elif ext in (".tar", ".tgz", ".gz", ".tar.gz"):
-            try:
-                with tarfile.open(file_path, "r:*") as tf:
-                    for member in tf.getmembers():
-                        if not member.isfile():
-                            continue
-                        try:
-                            fobj = tf.extractfile(member)
-                            if fobj is None:
-                                continue
-                            raw = fobj.read()
-                            if _is_probably_text(raw):
-                                results.append((member.name, _safe_read_bytes(raw)))
-                        except Exception:
-                            continue
-            except Exception as e:
-                # bare .gz (not .tar.gz)
-                if ext == ".gz":
+    if ext == ".zip":
+        try:
+            with zipfile.ZipFile(file_path, "r") as zf:
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
                     try:
-                        with gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") as gf:
-                            results.append((file_path.stem, gf.read()))
-                    except Exception as e2:
-                        log.warning(f"GZ read failed {file_path.name}: {e2}")
-                else:
-                    log.warning(f"TAR read failed {file_path.name}: {e}")
+                        with zf.open(member, "r") as fh:
+                            yield from _stream_binary_lines(fh, member.filename)
+                    except Exception as e:
+                        log.warning(f"ZIP member read failed {member.filename}: {e}")
+        except Exception as e:
+            log.warning(f"ZIP read failed {file_path.name}: {e}")
+        return
 
-        elif ext in (".bz2", ".xz"):
+    if ext == ".rar":
+        try:
+            import rarfile  # type: ignore
             try:
-                import bz2
-                import lzma
-                opener = bz2.open if ext == ".bz2" else lzma.open
-                with opener(file_path, "rt", encoding="utf-8", errors="ignore") as fh:
-                    results.append((file_path.stem, fh.read()))
-            except Exception as e:
-                log.warning(f"Compressed read failed {file_path.name}: {e}")
-
-        else:
-            # last-resort: try to read as plain text
-            try:
-                with open(file_path, "rb") as f:
-                    raw = f.read()
-                if _is_probably_text(raw):
-                    results.append((file_path.name, _safe_read_bytes(raw)))
+                rarfile.UNRAR_TOOL = "unrar"
             except Exception:
                 pass
+            with rarfile.RarFile(file_path, "r") as rf:
+                for member in rf.infolist():
+                    if member.is_dir():
+                        continue
+                    try:
+                        with rf.open(member, "r") as fh:
+                            yield from _stream_binary_lines(fh, member.filename)
+                    except Exception as e:
+                        log.warning(f"RAR member read failed {member.filename}: {e}")
+        except ImportError:
+            log.warning("rarfile not installed — skipping .rar contents")
+        except Exception as e:
+            log.warning(f"RAR read failed {file_path.name}: {e}")
+        return
 
+    if ext == ".7z":
+        try:
+            import py7zr  # type: ignore
+            with tempfile.TemporaryDirectory(prefix="akaza_7z_") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                with py7zr.SevenZipFile(file_path, mode="r") as sz:
+                    sz.extractall(path=tmp_path)
+                for extracted_file in tmp_path.rglob("*"):
+                    if not extracted_file.is_file():
+                        continue
+                    try:
+                        rel = str(extracted_file.relative_to(tmp_path))
+                        with open(extracted_file, "rb") as fh:
+                            yield from _stream_binary_lines(fh, rel)
+                    except Exception as e:
+                        log.warning(f"7z member read failed {extracted_file}: {e}")
+        except ImportError:
+            log.warning("py7zr not installed — skipping .7z contents")
+        except Exception as e:
+            log.warning(f"7z read failed {file_path.name}: {e}")
+        return
+
+    if ext in (".tar", ".tgz", ".gz"):
+        try:
+            with tarfile.open(file_path, "r:*") as tf:
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    try:
+                        fobj = tf.extractfile(member)
+                        if fobj is not None:
+                            yield from _stream_binary_lines(fobj, member.name)
+                    except Exception as e:
+                        log.warning(f"TAR member read failed {member.name}: {e}")
+            return
+        except Exception as e:
+            if ext != ".gz":
+                log.warning(f"TAR read failed {file_path.name}: {e}")
+                return
+            try:
+                with gzip.open(file_path, "rb") as fh:
+                    yield from _stream_binary_lines(fh, file_path.stem)
+            except Exception as e2:
+                log.warning(f"GZ read failed {file_path.name}: {e2}")
+            return
+
+    if ext in (".bz2", ".xz"):
+        try:
+            import bz2
+            import lzma
+            opener = bz2.open if ext == ".bz2" else lzma.open
+            with opener(file_path, "rb") as fh:
+                yield from _stream_binary_lines(fh, file_path.stem)
+        except Exception as e:
+            log.warning(f"Compressed read failed {file_path.name}: {e}")
+        return
+
+    try:
+        with open(file_path, "rb") as f:
+            yield from _stream_binary_lines(f, file_path.name)
     except Exception as e:
-        log.error(f"Unhandled error processing {file_path.name}: {e}")
+        log.warning(f"Failed reading {file_path.name}: {e}")
 
-    return results
+
+def iter_text_files_from_path(file_path: Path) -> List[Tuple[str, str]]:
+    """Compatibility wrapper that groups streamed lines into text content."""
+    grouped: Dict[str, List[str]] = {}
+    for source_name, line in iter_text_lines_from_path(file_path):
+        grouped.setdefault(source_name, []).append(line)
+    return [(source_name, "".join(lines)) for source_name, lines in grouped.items()]
 
 
 # ===========================================================================
@@ -656,26 +697,16 @@ def _reconstruct_proxy(scheme: str, host: str, port: str,
     return f"{scheme}://{auth}{host}:{port}"
 
 
-def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, Any]]:
-    """
-    Scan a blob of text and return every proxy we can identify.
-    De-duplicates on (type, host, port, user, pass).
-
-    Processes line-by-line so that patterns never accidentally merge two
-    proxies that happen to sit on consecutive lines.
-
-    If `strict=True` (default), applies smart filtering to reject trash
-    like ULP URLs (https://example.com/login.php), database connection
-    strings, log entries, private IPs, and non-proxy ports.
-    """
-    seen: Set[Tuple] = set()
-    out: List[Dict[str, Any]] = []
+def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = True,
+                               seen: Optional[Set[Tuple]] = None,
+                               cap: Optional[int] = None,
+                               log_rejections: bool = True) -> Iterator[Dict[str, Any]]:
+    """Yield deduplicated proxies from an iterable of lines."""
+    seen = seen if seen is not None else set()
+    produced = 0
     rejected_trash = 0
 
-    # Split into individual lines (handles \n, \r\n, \r).
-    lines = re.split(r"\r\n|\r|\n", text)
-
-    for line in lines:
+    for line in lines_iterable:
         line = line.strip()
         if not line:
             continue
@@ -739,13 +770,29 @@ def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, 
             if key in seen:
                 continue
             seen.add(key)
-            out.append(proxy)
+            yield proxy
+            produced += 1
+            if cap is not None and produced >= cap:
+                return
             break  # one proxy per line is the common case
 
-    if rejected_trash > 0 and strict:
+    if rejected_trash > 0 and strict and log_rejections:
         log.info(f"Smart filter rejected {rejected_trash} trash entries (URLs, log lines, non-proxy ports, etc.)")
 
-    return out
+def extract_proxies_from_text(text: str, strict: bool = True) -> List[Dict[str, Any]]:
+    """
+    Scan a blob of text and return every proxy we can identify.
+    De-duplicates on (type, host, port, user, pass).
+
+    Processes line-by-line so that patterns never accidentally merge two
+    proxies that happen to sit on consecutive lines.
+
+    If `strict=True` (default), applies smart filtering to reject trash
+    like ULP URLs (https://example.com/login.php), database connection
+    strings, log entries, private IPs, and non-proxy ports.
+    """
+    lines = re.split(r"\r\n|\r|\n", text)
+    return list(extract_proxies_from_lines(lines, strict=strict))
 
 
 def extract_proxies_from_files(file_path: Path, strict: bool = True) -> Dict[str, List[Dict[str, Any]]]:
@@ -756,10 +803,23 @@ def extract_proxies_from_files(file_path: Path, strict: bool = True) -> Dict[str
     If `strict=True` (default), applies smart filtering to reject trash.
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for fname, text in iter_text_files_from_path(file_path):
-        proxies = extract_proxies_from_text(text, strict=strict)
-        if proxies:
-            out[fname] = proxies
+    seen: Set[Tuple] = set()
+    total = 0
+
+    for source_name, line in iter_text_lines_from_path(file_path):
+        if total >= EXTRACT_MAX_PROXIES:
+            break
+        for proxy in extract_proxies_from_lines(
+            (line,), strict=strict, seen=seen,
+            cap=EXTRACT_MAX_PROXIES - total,
+            log_rejections=False,
+        ):
+            out.setdefault(source_name, []).append(proxy)
+            total += 1
+            if total >= EXTRACT_MAX_PROXIES:
+                break
+    if total >= EXTRACT_MAX_PROXIES:
+        log.warning(f"Extraction proxy cap reached ({EXTRACT_MAX_PROXIES}); remaining input skipped")
     return out
 
 
@@ -883,43 +943,63 @@ def verify_proxies_streaming(proxies: List[Dict[str, Any]],
     (so the caller can stream live notifications) and `on_progress(done, total)`
     for periodic status updates.
 
-    Returns the full augmented list (same order as input).
+    Returns the full augmented list as results complete.
     """
     if not proxies:
         return []
-    results: List[Dict[str, Any]] = [None] * len(proxies)   # type: ignore
+    results: List[Dict[str, Any]] = []
     total = len(proxies)
 
     with ThreadPoolExecutor(max_workers=VERIFY_THREADS) as ex:
-        future_to_idx = {ex.submit(verify_one_proxy, p): i for i, p in enumerate(proxies)}
+        proxy_iter = iter(proxies)
+        future_to_proxy: Dict[Any, Dict[str, Any]] = {}
+        window = max(VERIFY_THREADS, VERIFY_THREADS * 4)
+
+        def submit_next():
+            try:
+                proxy = next(proxy_iter)
+            except StopIteration:
+                return False
+            future_to_proxy[ex.submit(verify_one_proxy, proxy)] = proxy
+            return True
+
+        for _ in range(window):
+            if not submit_next():
+                break
+
         done = 0
         last_progress_tick = 0
-        for fut in as_completed(future_to_idx):
-            idx = future_to_idx[fut]
-            try:
-                r = fut.result()
-            except Exception as e:
-                r = dict(proxies[idx])
-                r["working"]    = False
-                r["latency_ms"] = 0
-                r["error"]      = f"verify exception: {e}"
-            results[idx] = r
-            done += 1
-            # Per-result callback (for live notifications)
-            if on_result is not None:
+        while future_to_proxy:
+            completed, _ = wait(
+                future_to_proxy, return_when=FIRST_COMPLETED
+            )
+            for fut in completed:
+                proxy = future_to_proxy.pop(fut)
                 try:
-                    on_result(r)
-                except Exception:
-                    pass
-            # Progress callback (throttled to every 3 results or 1 second)
-            now = time.time()
-            if on_progress is not None and (done % 3 == 0 or done == total
-                                             or now - last_progress_tick > 1.0):
-                last_progress_tick = now
-                try:
-                    on_progress(done, total)
-                except Exception:
-                    pass
+                    r = fut.result()
+                except Exception as e:
+                    r = dict(proxy)
+                    r["working"]    = False
+                    r["latency_ms"] = 0
+                    r["error"]      = f"verify exception: {e}"
+                results.append(r)
+                done += 1
+                submit_next()
+                # Per-result callback (for live notifications)
+                if on_result is not None:
+                    try:
+                        on_result(r)
+                    except Exception:
+                        pass
+                # Progress callback (throttled to every 3 results or 1 second)
+                now = time.time()
+                if on_progress is not None and (done % 3 == 0 or done == total
+                                                 or now - last_progress_tick > 1.0):
+                    last_progress_tick = now
+                    try:
+                        on_progress(done, total)
+                    except Exception:
+                        pass
     return results
 
 
@@ -928,6 +1008,7 @@ def verify_proxies_streaming(proxies: List[Dict[str, Any]],
 # ===========================================================================
 try:
     from pyrogram import Client, filters
+    from pyrogram.errors import MessageNotModified
     from pyrogram.types import (
         Message, CallbackQuery, InlineKeyboardMarkup,
         InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton,
@@ -936,6 +1017,7 @@ try:
     PYROGRAM_AVAILABLE = True
 except Exception:
     PYROGRAM_AVAILABLE = False
+    MessageNotModified = type("MessageNotModified", (Exception,), {})
 
 
 # ---- Branding strings -----------------------------------------------------
@@ -1038,10 +1120,10 @@ HELP_TEXT = f"""
   plus the final .txt summary at the end.
 • **OFF** — you only receive the final .txt summary at the end.
 
-**📥 MTProto Parallel Chunked Download**
-Files are downloaded using Pyrogram's MTProto engine with 16 parallel
-chunk workers.  Handles **GB-sized files** easily — download progress
-is shown live (MB downloaded / total MB / speed / ETA).
+**📥 MTProto Download**
+Files are downloaded using Pyrogram's MTProto engine with the configured
+worker and transmission limits.  Download progress is shown live
+(MB downloaded / total MB / speed / ETA).
 
 **📊 Live Dashboard**
 While processing, you'll see real-time updates:
@@ -1680,6 +1762,7 @@ def build_admin_keyboard() -> "InlineKeyboardMarkup":
             InlineKeyboardButton(f"⛔  Banned ({banned})",   callback_data="adm_banned"),
             InlineKeyboardButton(f"✅  Approved ({approved})", callback_data="adm_approved"),
         ],
+        [InlineKeyboardButton("🔄  Refresh", callback_data="adm_back")],
         [InlineKeyboardButton("⬅️  Back to Dashboard", callback_data="act_start")],
     ])
 
@@ -2091,6 +2174,63 @@ async def submit_extract_job(file_path: Path, strict: bool = True) -> Tuple[asyn
     return fut, jobs_ahead
 
 
+async def _safe_edit(msg, text, reply_markup=None):
+    """Edit a Telegram message while tolerating duplicate updates."""
+    try:
+        await msg.edit_text(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        log.warning(f"Failed editing Telegram message: {e}")
+
+
+def admin_panel_text() -> str:
+    """Build the live admin dashboard status text."""
+    users = UserStore.all_users()
+    banned = sum(1 for u in users if u.get("banned"))
+    approved = sum(1 for u in users if u.get("approved"))
+    locked = UserStore.is_bot_locked()
+    queue_depth = _EXTRACT_JOB_QUEUE.qsize() if _EXTRACT_JOB_QUEUE is not None else 0
+    disk_text = "unknown"
+    try:
+        disk = shutil.disk_usage(DOWNLOADS)
+        disk_text = f"{disk.free / 1024 / 1024:.1f} MB free"
+    except Exception:
+        pass
+    memory_text = ""
+    try:
+        import psutil  # type: ignore
+        memory_text = f"\n💾  Memory       : `{psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB`"
+    except Exception:
+        pass
+    uptime = int(max(0, time.time() - PROCESS_START_TIME))
+    uptime_text = f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s"
+    return (
+        f"**{BRAND} — Admin Panel**\n\n"
+        f"**Users**\n"
+        f"👥  Total        : `{len(users)}`\n"
+        f"✅  Approved     : `{approved}`\n"
+        f"⛔  Banned       : `{banned}`\n"
+        f"🔒  Bot status   : `{'LOCKED' if locked else 'OPEN'}`\n\n"
+        f"**Runtime**\n"
+        f"🧵  Extract queue: `{queue_depth}` waiting\n"
+        f"💿  Disk         : `{disk_text}`"
+        f"{memory_text}\n"
+        f"⏱  Uptime       : `{uptime_text}`\n\n"
+        f"**Configuration**\n"
+        f"📥  Download workers : `{DOWNLOAD_WORKERS}`\n"
+        f"🔎  Verify threads   : `{VERIFY_THREADS}`\n"
+        f"📦  Extract cap      : `{EXTRACT_MAX_PROXIES}`\n"
+        f"✅  Verify cap       : `{VERIFY_MAX_PROXIES}`\n"
+        f"📏  File size limit  : `{MAX_FILE_SIZE_MB} MB`\n\n"
+        f"— Credit: **{DEV_HANDLE}**"
+    )
+
+
 def register_handlers(application: "Client"):
     global app
     app = application
@@ -2114,8 +2254,8 @@ def register_handlers(application: "Client"):
                 f"You're new here — here's the quick start:\n\n"
                 f"1️⃣  Tap **🚀 Send File to Extract** below and upload a `.txt` / "
                 f"`.zip` / `.rar` / `.7z` file containing proxies.\n"
-                f"2️⃣  Bot downloads it via MTProto (16 parallel chunks — handles "
-                f"GB-sized files), extracts every proxy, and verifies each one.\n"
+                f"2️⃣  Bot downloads it via MTProto ({DOWNLOAD_WORKERS} workers), "
+                f"extracts every proxy, and verifies each one.\n"
                 f"3️⃣  You'll see live download / extract / verify progress with timing.\n"
                 f"4️⃣  Working proxies are sent as a `.txt` (or `.csv` / `.json` — "
                 f"see ⚙️ Settings).\n\n"
@@ -2246,19 +2386,8 @@ def register_handlers(application: "Client"):
         if not is_admin(user.id):
             await _deny(client, message, "⛔ Admin only.")
             return
-        users = UserStore.all_users()
-        banned   = sum(1 for u in users if u.get("banned"))
-        approved = sum(1 for u in users if u.get("approved"))
-        locked   = UserStore.is_bot_locked()
-        lock_emoji = "🔒 LOCKED" if locked else "🔓 OPEN"
         await message.reply(
-            f"**{BRAND} — Admin Panel**\n\n"
-            f"👥  Total users   : `{len(users)}`\n"
-            f"✅  Approved      : `{approved}`\n"
-            f"⛔  Banned        : `{banned}`\n"
-            f"🔒  Bot status    : `{lock_emoji}`\n\n"
-            f"Use the buttons below to manage users.\n\n"
-            f"— Credit: **{DEV_HANDLE}**",
+            admin_panel_text(),
             reply_markup=build_admin_keyboard(),
             protect_content=True,
         )
@@ -2575,7 +2704,7 @@ def register_handlers(application: "Client"):
             f"**⚙️  Engine**\n"
             f"🔧  Verify threads  : `{VERIFY_THREADS}`\n"
             f"⏱   Verify timeout  : `{VERIFY_TIMEOUT}s`\n"
-            f"📥  MTProto workers : `16`\n\n"
+            f"📥  MTProto workers : `{DOWNLOAD_WORKERS}`\n\n"
             f"— Credit: **{DEV_HANDLE}**"
         )
         await message.reply(text, protect_content=True)
@@ -2688,10 +2817,10 @@ def register_handlers(application: "Client"):
                 return
 
             if data == "act_start":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     WELCOME_TEXT,
                     reply_markup=build_dashboard_keyboard(is_admin(user.id)),
-                    disable_web_page_preview=True,
                 )
             elif data == "act_send":
                 await cb.answer("📤 Send any file now", show_alert=False)
@@ -2702,30 +2831,33 @@ def register_handlers(application: "Client"):
                     reply_markup=build_cancel_keyboard(),
                 )
             elif data == "act_help":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     HELP_TEXT,
                     reply_markup=build_cancel_keyboard(),
-                    disable_web_page_preview=True,
                 )
             elif data == "act_stats":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     Stats.snapshot_for_user(user.id),
                     reply_markup=build_cancel_keyboard(),
                 )
             elif data == "act_myinfo":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(UserStore.get_user(user.id)),
                     reply_markup=build_cancel_keyboard(),
                 )
             elif data == "act_about":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     ABOUT_TEXT,
                     reply_markup=build_cancel_keyboard(),
-                    disable_web_page_preview=True,
                 )
 
             elif data == "act_settings":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2737,7 +2869,8 @@ def register_handlers(application: "Client"):
                 await cb.answer(
                     f"🔔 Live notifications {'ENABLED' if new_state else 'DISABLED'}"
                 )
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2750,7 +2883,8 @@ def register_handlers(application: "Client"):
                     nxt = "all"
                 UserStore.set_setting(user.id, "proxy_type_filter", nxt)
                 await cb.answer(f"🌐 Proxy type: {nxt.upper()}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2763,7 +2897,8 @@ def register_handlers(application: "Client"):
                     nxt = "txt"
                 UserStore.set_setting(user.id, "export_format", nxt)
                 await cb.answer(f"📥 Export format: {nxt.upper()}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2776,7 +2911,8 @@ def register_handlers(application: "Client"):
                     nxt = 0
                 UserStore.set_setting(user.id, "min_latency_ms", nxt)
                 await cb.answer(f"⚡ Min latency: {nxt}ms" if nxt else "⚡ Min latency: Off")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2789,7 +2925,8 @@ def register_handlers(application: "Client"):
                     nxt = 0
                 UserStore.set_setting(user.id, "max_latency_ms", nxt)
                 await cb.answer(f"🐢 Max latency: {nxt}ms" if nxt else "🐢 Max latency: Off")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2802,7 +2939,8 @@ def register_handlers(application: "Client"):
                     nxt = "date"
                 UserStore.set_setting(user.id, "sort_by", nxt)
                 await cb.answer(f"📊 Sort by: {nxt}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_settings_text(user.id),
                     reply_markup=build_settings_keyboard(user.id),
                 )
@@ -2824,7 +2962,8 @@ def register_handlers(application: "Client"):
                     await cb.answer("✅ Workspace cleared")
                 except Exception as e:
                     await cb.answer(f"❌ {e}", show_alert=True)
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND}**\n\n✅ Workspace cleared.\n\n— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_cancel_keyboard(),
                 )
@@ -2838,7 +2977,8 @@ def register_handlers(application: "Client"):
                     page = int(data.rsplit("_p", 1)[-1])
                 except Exception:
                     page = 1
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_working_proxies_page(user.id, page, viewer_is_admin=False),
                     reply_markup=build_working_proxies_keyboard(
                         user.id, page, viewer_is_admin=False),
@@ -2852,19 +2992,26 @@ def register_handlers(application: "Client"):
                     return
                 await cb.answer("📥 Building file...")
                 out_path = build_working_proxies_file(user.id)
-                await client.send_document(
-                    chat_id=cb.message.chat.id,
-                    document=str(out_path),
-                    caption=(
-                        f"**{BRAND}** — Your working proxy history\n"
-                        f"`{len(all_w)}` proxies · Credit: {DEV_HANDLE}"
-                    ),
-                )
+                try:
+                    await client.send_document(
+                        chat_id=cb.message.chat.id,
+                        document=str(out_path),
+                        caption=(
+                            f"**{BRAND}** — Your working proxy history\n"
+                            f"`{len(all_w)}` proxies · Credit: {DEV_HANDLE}"
+                        ),
+                    )
+                finally:
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             elif data == "act_clrproxies":
                 WorkingProxyStore.clear_user(user.id)
                 await cb.answer("🧹 History cleared")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND}**\n\n🧹 Your working proxy history has been cleared.\n\n"
                     f"— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_cancel_keyboard(),
@@ -2880,57 +3027,52 @@ def register_handlers(application: "Client"):
                 return
 
             if data == "adm_back":
-                users = UserStore.all_users()
-                banned   = sum(1 for u in users if u.get("banned"))
-                approved = sum(1 for u in users if u.get("approved"))
-                locked   = UserStore.is_bot_locked()
-                lock_emoji = "🔒 LOCKED" if locked else "🔓 OPEN"
-                await cb.message.edit_text(
-                    f"**{BRAND} — Admin Panel**\n\n"
-                    f"👥  Total users   : `{len(users)}`\n"
-                    f"✅  Approved      : `{approved}`\n"
-                    f"⛔  Banned        : `{banned}`\n"
-                    f"🔒  Bot status    : `{lock_emoji}`\n\n"
-                    f"— Credit: **{DEV_HANDLE}**",
+                await _safe_edit(
+                    cb.message,
+                    admin_panel_text(),
                     reply_markup=build_admin_keyboard(),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data == "adm_noop":
                 await cb.answer()
 
             elif data == "adm_lock":
                 UserStore.set_bot_locked(True)
+                AuditLog.log(user.id, "lock")
                 await cb.answer("🔒 Bot locked")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND} — Admin Panel**\n\n🔒 Bot is now **LOCKED**.\n\n— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_admin_keyboard(),
-                    protect_content=True,
                 )
 
             elif data == "adm_unlock":
                 UserStore.set_bot_locked(False)
+                AuditLog.log(user.id, "unlock")
                 await cb.answer("🔓 Bot unlocked")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND} — Admin Panel**\n\n🔓 Bot is now **OPEN** to everyone.\n\n— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_admin_keyboard(),
-                    protect_content=True,
                 )
 
             elif data == "adm_stats":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     Stats.snapshot(),
                     reply_markup=build_admin_keyboard(),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data == "adm_reset":
                 UserStore.reset_all_stats()
+                AuditLog.log(user.id, "reset_stats")
                 await cb.answer("🧹 All user stats reset")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND}**\n\n🧹 All user stats reset.\n\n— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_admin_keyboard(),
-                    protect_content=True,
                 )
 
             elif data.startswith("adm_users_p"):
@@ -2940,25 +3082,28 @@ def register_handlers(application: "Client"):
                     return
                 page = int(m.group("page"))
                 filter_kind = m.group("kind") or "all"
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND} — User List**\n\nTap a user to view details & actions:",
                     reply_markup=build_user_list_keyboard(page, 8, filter_kind),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data == "adm_banned":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND} — Banned Users**",
                     reply_markup=build_user_list_keyboard(1, 8, "banned"),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data == "adm_approved":
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND} — Approved Users**",
                     reply_markup=build_user_list_keyboard(1, 8, "approved"),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             # IMPORTANT: check 'adm_user_proxies_' BEFORE 'adm_user_' because
             # 'adm_user_proxies_123_p1' would otherwise match the 'adm_user_'
@@ -2977,12 +3122,13 @@ def register_handlers(application: "Client"):
                     page = int(parts[1]) if len(parts) > 1 else 1
                 except Exception:
                     page = 1
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_working_proxies_page(target, page, viewer_is_admin=True),
                     reply_markup=build_working_proxies_keyboard(
                         target, page, viewer_is_admin=True),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data.startswith("adm_user_"):
                 try:
@@ -2991,11 +3137,12 @@ def register_handlers(application: "Client"):
                     await cb.answer("Invalid user", show_alert=True)
                     return
                 tu = UserStore.get_user(target)
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(tu),
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
+                await cb.answer()
 
             elif data.startswith("adm_ban_"):
                 try:
@@ -3007,13 +3154,14 @@ def register_handlers(application: "Client"):
                     await cb.answer("Cannot ban admin", show_alert=True)
                     return
                 UserStore.set_banned(target, True)
+                AuditLog.log(user.id, "ban", target=target)
                 tu = UserStore.get_user(target)
                 name = tu.get("first_name") or tu.get("username") or target
                 await cb.answer(f"⛔ Banned {name}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(tu),
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
 
             elif data.startswith("adm_unban_"):
@@ -3023,13 +3171,14 @@ def register_handlers(application: "Client"):
                     await cb.answer("Invalid user", show_alert=True)
                     return
                 UserStore.set_banned(target, False)
+                AuditLog.log(user.id, "unban", target=target)
                 tu = UserStore.get_user(target)
                 name = tu.get("first_name") or tu.get("username") or target
                 await cb.answer(f"♻️ Unbanned {name}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(tu),
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
 
             elif data.startswith("adm_appr_"):
@@ -3041,13 +3190,14 @@ def register_handlers(application: "Client"):
                 UserStore.set_approved(target, True)
                 if UserStore.is_banned(target):
                     UserStore.set_banned(target, False)
+                AuditLog.log(user.id, "approve", target=target)
                 tu = UserStore.get_user(target)
                 name = tu.get("first_name") or tu.get("username") or target
                 await cb.answer(f"✅ Approved {name}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(tu),
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
 
             elif data.startswith("adm_unappr_"):
@@ -3057,13 +3207,14 @@ def register_handlers(application: "Client"):
                     await cb.answer("Invalid user", show_alert=True)
                     return
                 UserStore.set_approved(target, False)
+                AuditLog.log(user.id, "unapprove", target=target)
                 tu = UserStore.get_user(target)
                 name = tu.get("first_name") or tu.get("username") or target
                 await cb.answer(f"❌ Removed approval for {name}")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     format_user_info(tu),
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
 
             elif data.startswith("adm_dlproxies_"):
@@ -3080,15 +3231,21 @@ def register_handlers(application: "Client"):
                 await cb.answer("📥 Building file...")
                 out_path = build_working_proxies_file(target)
                 # protect_content=True so the file cannot be forwarded
-                await client.send_document(
-                    chat_id=cb.message.chat.id,
-                    document=str(out_path),
-                    caption=(
-                        f"**{BRAND}** — Working proxies for user `{target}`\n"
-                        f"`{len(all_w)}` proxies · Credit: {DEV_HANDLE}"
-                    ),
-                    protect_content=True,
-                )
+                try:
+                    await client.send_document(
+                        chat_id=cb.message.chat.id,
+                        document=str(out_path),
+                        caption=(
+                            f"**{BRAND}** — Working proxies for user `{target}`\n"
+                            f"`{len(all_w)}` proxies · Credit: {DEV_HANDLE}"
+                        ),
+                        protect_content=True,
+                    )
+                finally:
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             elif data.startswith("adm_clrproxies_"):
                 # Admin clears a user's working proxy history
@@ -3098,12 +3255,13 @@ def register_handlers(application: "Client"):
                     await cb.answer("Invalid user", show_alert=True)
                     return
                 WorkingProxyStore.clear_user(target)
+                AuditLog.log(user.id, "clear_proxies", target=target)
                 await cb.answer("🧹 History cleared")
-                await cb.message.edit_text(
+                await _safe_edit(
+                    cb.message,
                     f"**{BRAND}**\n\n🧹 Working proxy history cleared for `{target}`.\n\n"
                     f"— Credit: **{DEV_HANDLE}**",
                     reply_markup=build_user_detail_keyboard(target),
-                    protect_content=True,
                 )
             else:
                 await cb.answer("⚠️ Unknown admin button", show_alert=True)
@@ -3137,18 +3295,42 @@ def register_handlers(application: "Client"):
 
         log.info(f"Received file: {fname} ({ext}, {size_mb:.1f} MB) from user {user.id}")
 
+        if file_size and size_mb > MAX_FILE_SIZE_MB:
+            await message.reply(
+                f"**{BRAND}**\n\n"
+                f"❌ This file is `{size_mb:.2f} MB`, above the "
+                f"`{MAX_FILE_SIZE_MB} MB` limit.\n\n"
+                f"Please split the file into smaller parts and try again."
+            )
+            return
+
+        try:
+            if file_size:
+                disk = shutil.disk_usage(DOWNLOADS)
+                required = file_size * 3
+                if disk.free < required:
+                    await message.reply(
+                        f"**{BRAND}**\n\n"
+                        f"❌ Not enough free disk space to process this file.\n"
+                        f"Available: `{disk.free / 1024 / 1024:.1f} MB`\n"
+                        f"Required: approximately `{required / 1024 / 1024:.1f} MB`."
+                    )
+                    return
+        except Exception as e:
+            log.warning(f"Disk-space check failed: {e}")
+
         # Initial status
         size_str = f"📦 Size: `{size_mb:.2f} MB`" if file_size else "📦 Size: unknown"
         status_msg = await message.reply(
             f"**{BRAND}**\n\n"
             f"📥 File: `{fname}`\n"
             f"{size_str}\n"
-            f"⏳ Downloading via MTProto (16 parallel chunks)...\n\n"
+            f"⏳ Downloading via MTProto ({DOWNLOAD_WORKERS} workers)...\n\n"
             f"— Credit: **{DEV_HANDLE}**"
         )
 
         # ---- Download with progress callback ----
-        local_path = DOWNLOADS / f"{user.id}_{fname}"
+        local_path = DOWNLOADS / f"{user.id}_{Path(fname).name}"
         dl_state = {"last_tick": 0.0, "start": time.time(),
                     "last_bytes": 0, "last_edit": 0.0}
 
@@ -3184,6 +3366,10 @@ def register_handlers(application: "Client"):
                 progress=_dl_progress,
             )
         except Exception as e:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             await status_msg.edit_text(f"❌ Download failed: `{e}`")
             return
 
@@ -3225,6 +3411,10 @@ def register_handlers(application: "Client"):
                 await asyncio.sleep(1.25)
             per_file = await extract_future
         except Exception as e:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             await status_msg.edit_text(f"❌ Extract failed: `{e}`")
             return
         extract_elapsed = time.time() - extract_start
@@ -3253,9 +3443,16 @@ def register_handlers(application: "Client"):
             return
 
         # ---- Verification ----
+        verify_proxies = all_proxies[:VERIFY_MAX_PROXIES]
+        verify_note = ""
+        if len(all_proxies) > VERIFY_MAX_PROXIES:
+            verify_note = (
+                f"⚠️ Verifying first `{VERIFY_MAX_PROXIES}` of "
+                f"`{len(all_proxies)}` extracted (cap)\n"
+            )
         notif_state = {
             "working": 0, "failed": 0, "done": 0,
-            "total": len(all_proxies),
+            "total": len(verify_proxies),
             "last_edit": 0.0,
             "live_batch": [],  # batch live notifications to reduce spam
             "last_live_send": 0.0,
@@ -3314,6 +3511,7 @@ def register_handlers(application: "Client"):
             f"📥 File: `{fname}`\n"
             f"✅ Download: `{dl_elapsed:.1f}s` · 🔎 Extract: `{extract_elapsed:.2f}s`\n"
             f"🔎 Proxies found: `{len(all_proxies)}`\n"
+            f"{verify_note}"
             f"⏳ Verifying in parallel (max {VERIFY_THREADS} workers)...\n\n"
             f"**Sources:**\n" + "\n".join(per_file_summary[:8]) +
             (f"\n  ...and {len(per_file_summary)-8} more" if len(per_file_summary) > 8 else "") +
@@ -3328,7 +3526,7 @@ def register_handlers(application: "Client"):
 
         def _run_verify():
             result_box["results"] = verify_proxies_streaming(
-                all_proxies,
+                verify_proxies,
                 on_result=_on_result,
                 on_progress=_on_progress,
             )
@@ -3365,6 +3563,10 @@ def register_handlers(application: "Client"):
         verify_elapsed = time.time() - verify_start
 
         if results is None:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             await status_msg.edit_text("❌ Verify failed unexpectedly.")
             return
 
@@ -3415,6 +3617,10 @@ def register_handlers(application: "Client"):
             f.write(f"# {BRAND} — Failed Proxies\n# Credit: {DEV_HANDLE}\n")
             for r in failed:
                 f.write(f"{r['raw']}    # {r.get('error','unknown')}\n")
+        try:
+            fail_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         # Send the final summary
         rate = (len(working) / len(all_proxies) * 100) if all_proxies else 0
@@ -3429,6 +3635,7 @@ def register_handlers(application: "Client"):
             f"**{BRAND} — Done!**\n\n"
             f"📥 Source file : `{fname}`\n"
             f"📦 Size        : `{size_mb:.2f} MB`\n\n"
+            f"{verify_note}\n"
             f"**⏱  Timing**\n"
             f"⬇️  Download : `{dl_elapsed:.1f}s` (`{dl_speed:.2f} MB/s`)\n"
             f"🔎  Extract  : `{extract_elapsed:.2f}s`\n"
@@ -3494,12 +3701,18 @@ def register_handlers(application: "Client"):
                     for r in sorted(working, key=lambda x: x.get("latency_ms", 9999)):
                         f.write(f"{r['raw']}    # {r['latency_ms']}ms\n")
 
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=str(out_path),
-                caption=f"**{BRAND}** — {len(working)} working proxies ({fmt})\n"
-                        f"Credit: {DEV_HANDLE}",
-            )
+            try:
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=str(out_path),
+                    caption=f"**{BRAND}** — {len(working)} working proxies ({fmt})\n"
+                            f"Credit: {DEV_HANDLE}",
+                )
+            finally:
+                try:
+                    out_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         # Clean up the uploaded file
         try: local_path.unlink(missing_ok=True)
@@ -3721,9 +3934,10 @@ def main():
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
         workdir=str(WORK_DIR),
-        # MTProto parallel chunk download workers (default 16, min 8).
-        # Can be overridden via DOWNLOAD_WORKERS in .env.
         workers=DOWNLOAD_WORKERS,
+        max_concurrent_transmissions=max(
+            1, int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "4"))
+        ),
     )
     register_handlers(client)
 
