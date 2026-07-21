@@ -1,0 +1,6 @@
+# Scraper (cnfans_capture.py / cnfans_set_token.py) — this is all you need to capture:
+requests>=2.31.0
+
+# Login only (cnfans_login.py). Install + `playwright install chromium`.
+# Not needed if you supply the token via cnfans_set_token.py.
+playwright>=1.44.0
