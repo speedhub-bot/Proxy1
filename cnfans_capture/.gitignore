@@ -1,0 +1,4 @@
+session.json
+cnfans_snapshot.json
+*.pyc
+__pycache__/
