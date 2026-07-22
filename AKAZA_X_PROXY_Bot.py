@@ -409,7 +409,11 @@ HOST_RE   = r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}"
 # become port 12345 (which would then be reconstructed against the wrong number).
 PORT_RE   = r"\d{2,5}(?!\d)"
 USER_RE   = r"[A-Za-z0-9_\-\.]+"
-PASS_RE   = r"[A-Za-z0-9_\-\.~!\$&\*\(\)\+\=;:%@\#\?\,\/]+"
+# Password/credential token: proxy passwords routinely contain almost any
+# printable symbol ({ } | & ! $ % etc.), so accept any run of non-space chars
+# that is not the "@" that delimits the credentials from the host. Anchored
+# full-line matching keeps this safe from grabbing junk.
+PASS_RE   = r"[^\s@]+"
 # Expanded scheme list — covers HTTP/HTTPS/SOCKS4/SOCKS4a/SOCKS5/SOCKS5h +
 # less common ones (quic, ssl, connect, ftp, ssh, proxy).  Unknown schemes
 # fall back to "http" in the classifier.
@@ -593,7 +597,8 @@ def _is_private_ip(ip: str) -> bool:
 
 
 def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int,
-                           explicit_scheme: bool = False) -> bool:
+                           explicit_scheme: bool = False,
+                           has_auth: bool = False) -> bool:
     """
     Smart context filter — returns True if this line REALLY looks like a proxy.
 
@@ -661,7 +666,17 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int,
     if _is_private_ip(host):
         return False
 
-    # Must be on a common proxy port
+    # An authenticated line (user:pass@host:port) is unambiguous proxy
+    # credentials — real auth proxies routinely use non-standard ports
+    # (e.g. 10780). Accept on ANY valid port, only guarding against lines
+    # that look like logs (handled below via the token/marker checks).
+    if has_auth:
+        if len(line_stripped.split()) > 6:
+            return False
+        return True
+
+    # Bare host:port with NO auth — stay strict: require a known proxy port so
+    # ULP noise like "example.com:443" is not treated as a proxy.
     if port not in BARE_PROXY_PORTS:
         return False
 
@@ -780,6 +795,7 @@ def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = Tru
                 if not _looks_like_proxy_line(
                     candidate, proxy.get("scheme", ""), host, port_int,
                     explicit_scheme=bool(scheme),
+                    has_auth=bool(user and pwd),
                 ):
                     rejected_trash += 1
                     continue  # try next pattern on this line
@@ -826,6 +842,11 @@ def run_filter_selftest() -> bool:
         "1.2.3.4\t8080\tuser\tpass",
         "HTTP 1.2.3.4:8080",
         "1.2.3.4:8080:socks5",
+        # Authenticated proxies on a non-standard port with special-char
+        # passwords (real PureVPN-style ULP export lines).
+        "purevpn0s7418668:hkoerprqpmtz@px022409.pointtoserver.com:10780",
+        "purevpn0s13289443:4C5BS}S8pW&YK8@px014004.pointtoserver.com:10780",
+        "user123:P4ss|word&{x}$@proxy.example.com:31280",
     ]
     negative = [
         "https://site.com/login.php:user:pass",
@@ -834,6 +855,8 @@ def run_filter_selftest() -> bool:
         "[error] GET /x 1.2.3.4:80",
         '{"proxy": "1.2.3.4:8080"}',
         "email@x.com:password",
+        # Bare domain on a non-standard port WITHOUT credentials stays trash.
+        "px014004.pointtoserver.com:10780",
     ]
     failures = []
     for sample in positive:
