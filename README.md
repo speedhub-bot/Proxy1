@@ -30,13 +30,20 @@ cd akaza-x-proxy
 bash setup.sh
 ```
 
-That's it. The script will:
-1. ✅ Create a Python virtual environment (`.venv/`)
-2. ✅ Install all dependencies (pyrogram, tgcrypto, requests, rarfile, py7zr, ...)
-3. ❓ Ask you to paste your `BOT_TOKEN` (just paste + Enter)
-4. ❓ Ask you for your `ADMIN_ID` (just type the number + Enter)
-5. ✅ Save them to a `.env` file (you don't edit any code!)
-6. 🚀 Start the bot
+That's it. The script is **fully self-contained and idempotent** — run it on a
+brand-new server and it does everything itself. It will:
+1. ✅ Install Python 3 (+ `venv`) automatically **if it's missing** — on apt, dnf/yum, pacman, apk, or Termux. Already installed? It's left as-is (no upgrades).
+2. ✅ Install `unrar` / `p7zip` automatically if missing (for `.rar` / `.7z` archives)
+3. ✅ Create the virtual environment (`.venv/`) — reused if it already exists
+4. ✅ Install all dependencies (pyrogram, tgcrypto, requests, rarfile, py7zr, ...) — skipped when already up to date
+5. ❓ Ask you to paste your `BOT_TOKEN` and `ADMIN_ID` (or read them from a `.env` file / environment variables)
+6. ✅ Save them to a `.env` file (you don't edit any code!)
+7. 🚀 Start the bot in the background with `nohup`
+
+Fully hands-off (no prompts) — provide the two values up front:
+```bash
+BOT_TOKEN=123456:ABC-DEF ADMIN_ID=123456789 bash setup.sh
+```
 
 You'll see:
 ```

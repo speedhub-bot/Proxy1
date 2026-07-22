@@ -46,7 +46,7 @@ print_header() {
     echo ""
     echo -e "${CYAN}=================================================="
     echo "  AKAZA X PROXY  -  Setup & Bot Manager"
-    echo "  v6.2 — Phone-friendly"
+    echo "  v7.0 — Self-contained auto-install"
     echo "  Credit: @akaza_isnt"
     echo -e "==================================================${NC}"
     echo ""
@@ -76,108 +76,258 @@ is_running() {
 }
 
 # ============================================================================
-# SETUP Command (Full Setup - Original Setup Steps)
+# Auto-install helpers  —  detect the OS package manager and install only
+# what is missing.  Everything here is idempotent: already-installed tools
+# are left untouched (no upgrades), and .venv is never recreated.
+# ============================================================================
+
+# Global chosen Python interpreter (set by ensure_python).
+PY=""
+
+# Populated by detect_pkg_manager.
+PKG_MANAGER=""
+SUDO=""
+
+detect_pkg_manager() {
+    # Choose sudo only when we are not already root and sudo exists.
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        SUDO=""
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MANAGER="pacman"
+    elif command -v apk >/dev/null 2>&1; then
+        PKG_MANAGER="apk"
+    elif command -v pkg >/dev/null 2>&1 && [ -n "${PREFIX:-}" ]; then
+        PKG_MANAGER="termux"   # Termux on Android (no sudo)
+        SUDO=""
+    else
+        PKG_MANAGER=""
+    fi
+}
+
+# Refresh package indexes once per run (best-effort).
+_pkg_updated=""
+pkg_update_once() {
+    [ -n "$_pkg_updated" ] && return 0
+    _pkg_updated="1"
+    case "$PKG_MANAGER" in
+        apt)    $SUDO apt-get update -y            >/dev/null 2>&1 || true ;;
+        pacman) $SUDO pacman -Sy --noconfirm        >/dev/null 2>&1 || true ;;
+        apk)    $SUDO apk update                    >/dev/null 2>&1 || true ;;
+        termux) pkg update -y                       >/dev/null 2>&1 || true ;;
+    esac
+}
+
+# pkg_install <space-separated package names> — best-effort, never aborts.
+pkg_install() {
+    local pkgs="$1"
+    [ -z "$pkgs" ] && return 0
+    [ -z "$PKG_MANAGER" ] && return 1
+    pkg_update_once
+    case "$PKG_MANAGER" in
+        apt)    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs >/dev/null 2>&1 || return 1 ;;
+        dnf)    $SUDO dnf install -y $pkgs           >/dev/null 2>&1 || return 1 ;;
+        yum)    $SUDO yum install -y $pkgs           >/dev/null 2>&1 || return 1 ;;
+        pacman) $SUDO pacman -S --noconfirm --needed $pkgs >/dev/null 2>&1 || return 1 ;;
+        apk)    $SUDO apk add $pkgs                  >/dev/null 2>&1 || return 1 ;;
+        termux) pkg install -y $pkgs                 >/dev/null 2>&1 || return 1 ;;
+        *)      return 1 ;;
+    esac
+    return 0
+}
+
+ensure_python() {
+    if command -v python3 >/dev/null 2>&1; then
+        PY="python3"
+    elif command -v python >/dev/null 2>&1; then
+        PY="python"
+    fi
+
+    # Already present — never upgrade, just confirm venv support exists.
+    if [ -n "$PY" ] && "$PY" -m venv --help >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Missing (or missing the venv module) — install it.
+    echo -e "${YELLOW}    Python (or its venv module) not found — installing...${NC}"
+    case "$PKG_MANAGER" in
+        apt)    pkg_install "python3 python3-venv python3-pip" || true ;;
+        dnf|yum) pkg_install "python3 python3-pip" || true ;;
+        pacman) pkg_install "python python-pip" || true ;;
+        apk)    pkg_install "python3 py3-pip" || true ;;
+        termux) pkg_install "python" || true ;;
+        *)      : ;;
+    esac
+
+    if command -v python3 >/dev/null 2>&1; then
+        PY="python3"
+    elif command -v python >/dev/null 2>&1; then
+        PY="python"
+    fi
+
+    if [ -z "$PY" ] || ! "$PY" -m venv --help >/dev/null 2>&1; then
+        echo -e "${RED}❌ Could not install Python 3 with venv support automatically.${NC}"
+        echo "   Install it manually, then re-run:"
+        echo "     Ubuntu/Debian:  sudo apt install python3 python3-pip python3-venv"
+        echo "     Fedora/RHEL:    sudo dnf install python3 python3-pip"
+        echo "     Arch:           sudo pacman -S python python-pip"
+        echo "     Alpine:         sudo apk add python3 py3-pip"
+        echo "     Termux:         pkg install python"
+        exit 1
+    fi
+}
+
+# Install unrar / p7zip only if the corresponding tool is missing. These are
+# optional (archive extraction) — failures are non-fatal.
+ensure_system_tools() {
+    if ! command -v unrar >/dev/null 2>&1 && ! command -v unar >/dev/null 2>&1; then
+        case "$PKG_MANAGER" in
+            apt)    pkg_install "unrar" || pkg_install "unar" || true ;;
+            dnf|yum) pkg_install "unrar" || pkg_install "unar" || true ;;
+            pacman) pkg_install "unrar" || true ;;
+            apk)    pkg_install "unrar" || true ;;
+            termux) pkg_install "unrar" || true ;;
+        esac
+    fi
+    if ! command -v 7z >/dev/null 2>&1 && ! command -v 7za >/dev/null 2>&1 \
+       && ! command -v 7zr >/dev/null 2>&1; then
+        case "$PKG_MANAGER" in
+            apt)    pkg_install "p7zip-full" || true ;;
+            dnf|yum) pkg_install "p7zip p7zip-plugins" || pkg_install "p7zip" || true ;;
+            pacman) pkg_install "p7zip" || true ;;
+            apk)    pkg_install "p7zip" || true ;;
+            termux) pkg_install "p7zip" || true ;;
+        esac
+    fi
+}
+
+_req_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum requirements.txt | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 requirements.txt | awk '{print $1}'
+    elif command -v md5sum >/dev/null 2>&1; then
+        md5sum requirements.txt | awk '{print $1}'
+    else
+        echo "nohash"
+    fi
+}
+
+# ============================================================================
+# SETUP Command (Full, self-contained, idempotent)
 # ============================================================================
 
 cmd_setup() {
     print_header
-    
-    # --- Check Python ---
+    detect_pkg_manager
+
+    # --- Ensure Python (auto-install if missing) ---
     echo -e "${YELLOW}[1/6] Checking Python...${NC}"
-    if command -v python3 >/dev/null 2>&1; then
-        PY=python3
-    elif command -v python >/dev/null 2>&1; then
-        PY=python
-    else
-        echo -e "${RED}❌ Python 3 is not installed.${NC}"
-        echo ""
-        echo "Install it first:"
-        echo "  Ubuntu/Debian:  sudo apt install python3 python3-pip python3-venv"
-        echo "  Termux:         pkg install python"
-        echo "  Alpine:         apk add python3 py3-pip"
-        exit 1
-    fi
-    echo -e "${GREEN}✅ Found: $($PY --version)${NC}"
+    ensure_python
+    echo -e "${GREEN}✅ Found: $($PY --version 2>&1)${NC}"
     echo ""
-    
-    # --- Create virtual environment ---
-    echo -e "${YELLOW}[2/6] Creating virtual environment (.venv)...${NC}"
-    if [ -d ".venv" ]; then
-        echo -e "${GREEN}✅ .venv already exists — skipping${NC}"
+
+    # --- Ensure archive tools (auto-install if missing) ---
+    echo -e "${YELLOW}[2/6] Checking archive tools (unrar / p7zip)...${NC}"
+    ensure_system_tools
+    echo -e "${GREEN}✅ Archive tools checked${NC}"
+    echo ""
+
+    # --- Create virtual environment (only if absent) ---
+    echo -e "${YELLOW}[3/6] Virtual environment (.venv)...${NC}"
+    local venv_fresh=""
+    if [ -d ".venv" ] && [ -x "$VENV_PYTHON" ]; then
+        echo -e "${GREEN}✅ .venv already exists — reusing${NC}"
     else
-        $PY -m venv .venv
+        # A partial/broken .venv would break pip; recreate only in that case.
+        [ -d ".venv" ] && rm -rf .venv
+        "$PY" -m venv .venv
+        venv_fresh="1"
         echo -e "${GREEN}✅ Created .venv${NC}"
     fi
     echo ""
-    
-    # --- Install dependencies ---
-    echo -e "${YELLOW}[3/6] Installing Python dependencies...${NC}"
-    .venv/bin/pip install --upgrade pip --quiet
-    .venv/bin/pip install -r requirements.txt --quiet
-    echo -e "${GREEN}✅ Dependencies installed${NC}"
+
+    # --- Install dependencies (only when fresh or requirements changed) ---
+    echo -e "${YELLOW}[4/6] Python dependencies...${NC}"
+    local req_hash marker
+    req_hash="$(_req_hash)"
+    marker=".venv/.deps_ok"
+    if [ -z "$venv_fresh" ] && [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$req_hash" ]; then
+        echo -e "${GREEN}✅ Dependencies already up to date — skipping${NC}"
+    else
+        [ -n "$venv_fresh" ] && "$VENV_PYTHON" -m pip install --upgrade pip --quiet
+        "$VENV_PYTHON" -m pip install -r requirements.txt --quiet
+        echo "$req_hash" > "$marker"
+        echo -e "${GREEN}✅ Dependencies installed${NC}"
+    fi
     echo ""
-    
-    # --- Ask for credentials ---
-    echo -e "${YELLOW}[4/6] Configure your bot${NC}"
-    echo ""
-    echo "You need two things:"
-    echo "  • BOT_TOKEN  → from @BotFather on Telegram (looks like 123456:ABC-DEF...)"
-    echo "  • ADMIN_ID   → your numeric Telegram user ID (from @userinfobot)"
-    echo ""
-    
-    # If .env already exists, show current values
+
+    # --- Resolve credentials (env → existing .env → interactive prompt) ---
+    echo -e "${YELLOW}[5/6] Configuring credentials...${NC}"
+    local token admin current_token current_admin
+    token="${BOT_TOKEN:-}"
+    admin="${ADMIN_ID:-}"
+    [ "$token" = "your_bot_token_here" ] && token=""
+
     if [ -f ".env" ]; then
-        echo -e "${YELLOW}Existing .env found. Press Enter to keep current value.${NC}"
-        CURRENT_TOKEN=$(grep "^BOT_TOKEN=" .env | cut -d= -f2- || echo "")
-        CURRENT_ADMIN=$(grep "^ADMIN_ID=" .env | cut -d= -f2- || echo "")
+        current_token="$(grep '^BOT_TOKEN=' .env | cut -d= -f2- || true)"
+        current_admin="$(grep '^ADMIN_ID=' .env | cut -d= -f2- || true)"
+        [ -z "$token" ] && token="$current_token"
+        [ -z "$admin" ] && admin="$current_admin"
     fi
-    
-    # Ask for BOT_TOKEN
-    if [ -n "$CURRENT_TOKEN" ] && [ "$CURRENT_TOKEN" != "BOT_TOKEN=" ]; then
-        read -p "BOT_TOKEN [current: ${CURRENT_TOKEN:0:15}...]: " NEW_TOKEN
-        TOKEN="${NEW_TOKEN:-$CURRENT_TOKEN}"
-    else
-        read -p "BOT_TOKEN: " TOKEN
+    [ "$token" = "your_bot_token_here" ] && token=""
+
+    if [ -z "$token" ] || [ -z "$admin" ]; then
+        if [ -t 0 ]; then
+            echo "  • BOT_TOKEN → from @BotFather   • ADMIN_ID → from @userinfobot"
+            [ -z "$token" ] && read -r -p "BOT_TOKEN: " token
+            [ -z "$admin" ] && read -r -p "ADMIN_ID: " admin
+        else
+            echo -e "${RED}❌ BOT_TOKEN / ADMIN_ID not provided and no terminal to prompt.${NC}"
+            echo "   Provide them non-interactively, e.g.:"
+            echo "     BOT_TOKEN=123:ABC ADMIN_ID=123456789 bash setup.sh"
+            echo "   or create a .env file with those two lines, then re-run."
+            exit 1
+        fi
     fi
-    
-    if [ -z "$TOKEN" ]; then
-        echo -e "${RED}❌ BOT_TOKEN is required.${NC}"
+
+    if [ -z "$token" ] || [ -z "$admin" ]; then
+        echo -e "${RED}❌ BOT_TOKEN and ADMIN_ID are both required.${NC}"
         exit 1
     fi
-    
-    # Ask for ADMIN_ID
-    if [ -n "$CURRENT_ADMIN" ]; then
-        read -p "ADMIN_ID [current: $CURRENT_ADMIN]: " NEW_ADMIN
-        ADMIN="${NEW_ADMIN:-$CURRENT_ADMIN}"
-    else
-        read -p "ADMIN_ID: " ADMIN
-    fi
-    
-    if [ -z "$ADMIN" ]; then
-        echo -e "${RED}❌ ADMIN_ID is required.${NC}"
-        exit 1
-    fi
-    
-    # Write .env
+
     cat > .env <<EOF
 # AKAZA X PROXY — auto-generated by setup.sh
-BOT_TOKEN=$TOKEN
-ADMIN_ID=$ADMIN
+BOT_TOKEN=$token
+ADMIN_ID=$admin
 EOF
-    
     echo -e "${GREEN}✅ Saved to .env${NC}"
     echo ""
-    
-    # --- Start the bot in nohup mode ---
-    echo -e "${YELLOW}[5/6] Starting bot in background (nohup mode)...${NC}"
+
+    # --- Start the bot in nohup mode (restart if already running) ---
+    echo -e "${YELLOW}[6/6] Starting bot in background (nohup mode)...${NC}"
     echo ""
-    
-    nohup $VENV_PYTHON "$BOT_SCRIPT" > "$NOHUP_LOG" 2>&1 &
+
+    if is_running; then
+        echo -e "${YELLOW}    Bot already running — restarting with new config...${NC}"
+        cmd_stop
+    fi
+
+    nohup "$VENV_PYTHON" "$BOT_SCRIPT" > "$NOHUP_LOG" 2>&1 &
     local pid=$!
     echo $pid > "$PID_FILE"
-    
+
     sleep 2
-    
+
     if is_running; then
         echo -e "${GREEN}✅ Bot started successfully in background!${NC}"
         echo -e "${GREEN}   PID: $pid${NC}"
@@ -187,7 +337,7 @@ EOF
         tail -20 "$NOHUP_LOG"
         exit 1
     fi
-    
+
     echo ""
     echo -e "${CYAN}=================================================="
     echo -e "${GREEN}  ✅ Setup Complete!${NC}"
