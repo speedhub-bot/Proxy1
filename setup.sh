@@ -46,7 +46,7 @@ print_header() {
     echo ""
     echo -e "${CYAN}=================================================="
     echo "  AKAZA X PROXY  -  Setup & Bot Manager"
-    echo "  v7.0 — Self-contained auto-install"
+    echo "  v7.1 — Self-contained auto-install + verify"
     echo "  Credit: @akaza_isnt"
     echo -e "==================================================${NC}"
     echo ""
@@ -145,42 +145,61 @@ pkg_install() {
     return 0
 }
 
-ensure_python() {
+_pick_python() {
     if command -v python3 >/dev/null 2>&1; then
         PY="python3"
     elif command -v python >/dev/null 2>&1; then
         PY="python"
+    else
+        PY=""
     fi
+}
 
-    # Already present — never upgrade, just confirm venv support exists.
-    if [ -n "$PY" ] && "$PY" -m venv --help >/dev/null 2>&1; then
-        return 0
-    fi
+# True only when this Python can actually build a WORKING venv (with pip).
+# On Debian/Ubuntu `python3` alone is not enough: the venv/ensurepip pieces
+# live in the separate python3-venv package, so `python3 -m venv .venv` dies
+# with "ensurepip is not available" / later "No module named pip". Checking
+# `import ensurepip` is the reliable signal for that missing piece.
+_python_ready() {
+    [ -n "$PY" ] || return 1
+    "$PY" -m venv -h        >/dev/null 2>&1 || return 1
+    "$PY" -c "import ensurepip" >/dev/null 2>&1 || return 1
+    return 0
+}
 
-    # Missing (or missing the venv module) — install it.
-    echo -e "${YELLOW}    Python (or its venv module) not found — installing...${NC}"
+ensure_python() {
+    _pick_python
+
+    # Already fully usable — never upgrade, just move on.
+    _python_ready && return 0
+
+    # Missing Python, or missing the venv/pip pieces (classic Debian case).
+    echo -e "${YELLOW}    Python 3 with venv + pip support not found — installing...${NC}"
     case "$PKG_MANAGER" in
-        apt)    pkg_install "python3 python3-venv python3-pip" || true ;;
+        apt)     pkg_install "python3 python3-venv python3-pip python3-full" \
+                   || pkg_install "python3 python3-venv python3-pip" || true ;;
         dnf|yum) pkg_install "python3 python3-pip" || true ;;
-        pacman) pkg_install "python python-pip" || true ;;
-        apk)    pkg_install "python3 py3-pip" || true ;;
-        termux) pkg_install "python" || true ;;
-        *)      : ;;
+        pacman)  pkg_install "python python-pip" || true ;;
+        apk)     pkg_install "python3 py3-pip" || true ;;
+        termux)  pkg_install "python" || true ;;
+        *)       : ;;
     esac
 
-    if command -v python3 >/dev/null 2>&1; then
-        PY="python3"
-    elif command -v python >/dev/null 2>&1; then
-        PY="python"
+    _pick_python
+
+    # Last-ditch: bootstrap ensurepip into the interpreter if the package
+    # manager left it disabled.
+    if [ -n "$PY" ] && ! "$PY" -c "import ensurepip" >/dev/null 2>&1; then
+        "$PY" -m ensurepip --version >/dev/null 2>&1 || true
     fi
 
-    if [ -z "$PY" ] || ! "$PY" -m venv --help >/dev/null 2>&1; then
-        echo -e "${RED}❌ Could not install Python 3 with venv support automatically.${NC}"
-        echo "   Install it manually, then re-run:"
-        echo "     Ubuntu/Debian:  sudo apt install python3 python3-pip python3-venv"
-        echo "     Fedora/RHEL:    sudo dnf install python3 python3-pip"
-        echo "     Arch:           sudo pacman -S python python-pip"
-        echo "     Alpine:         sudo apk add python3 py3-pip"
+    if ! _python_ready; then
+        echo -e "${RED}❌ Could not install Python 3 with venv + pip support automatically.${NC}"
+        echo "   Install it manually, then re-run (prefix with sudo only if not root):"
+        echo "     Debian/Ubuntu:  apt install -y python3 python3-venv python3-pip python3-full"
+        echo "     Fedora/RHEL:    dnf install -y python3 python3-pip"
+        echo "     Arch:           pacman -S python python-pip"
+        echo "     Alpine:         apk add python3 py3-pip"
         echo "     Termux:         pkg install python"
         exit 1
     fi
@@ -210,6 +229,35 @@ ensure_system_tools() {
     fi
 }
 
+# Install a C toolchain + Python headers so source-only packages (e.g. tgcrypto,
+# pyppmd) can compile when no prebuilt wheel exists for this Python version.
+# Best-effort; only called when a dependency install actually fails.
+_build_tools_tried=""
+ensure_build_tools() {
+    [ -n "$_build_tools_tried" ] && return 0
+    _build_tools_tried="1"
+    echo -e "${YELLOW}    Installing build tools (compiler + Python headers)...${NC}"
+    case "$PKG_MANAGER" in
+        apt)     pkg_install "build-essential python3-dev" || true ;;
+        dnf|yum) pkg_install "gcc gcc-c++ make python3-devel" || true ;;
+        pacman)  pkg_install "gcc make" || true ;;
+        apk)     pkg_install "build-base python3-dev" || true ;;
+        termux)  pkg_install "clang" || true ;;
+        *)       : ;;
+    esac
+}
+
+# Install project dependencies into the venv, auto-installing build tools and
+# retrying once if a source build fails. Returns non-zero if it still fails.
+install_requirements() {
+    if "$VENV_PYTHON" -m pip install -r requirements.txt --quiet 2>/tmp/akaza_pip_err; then
+        return 0
+    fi
+    echo -e "${YELLOW}    Some packages need compiling — resolving...${NC}"
+    ensure_build_tools
+    "$VENV_PYTHON" -m pip install -r requirements.txt
+}
+
 _req_hash() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum requirements.txt | awk '{print $1}'
@@ -231,33 +279,40 @@ cmd_setup() {
     detect_pkg_manager
 
     # --- Ensure Python (auto-install if missing) ---
-    echo -e "${YELLOW}[1/6] Checking Python...${NC}"
+    echo -e "${YELLOW}[1/7] Checking Python (venv + pip)...${NC}"
     ensure_python
-    echo -e "${GREEN}✅ Found: $($PY --version 2>&1)${NC}"
+    echo -e "${GREEN}✅ Found: $($PY --version 2>&1) (venv + pip ready)${NC}"
     echo ""
 
     # --- Ensure archive tools (auto-install if missing) ---
-    echo -e "${YELLOW}[2/6] Checking archive tools (unrar / p7zip)...${NC}"
+    echo -e "${YELLOW}[2/7] Checking archive tools (unrar / p7zip)...${NC}"
     ensure_system_tools
     echo -e "${GREEN}✅ Archive tools checked${NC}"
     echo ""
 
     # --- Create virtual environment (only if absent) ---
-    echo -e "${YELLOW}[3/6] Virtual environment (.venv)...${NC}"
+    echo -e "${YELLOW}[3/7] Virtual environment (.venv)...${NC}"
     local venv_fresh=""
-    if [ -d ".venv" ] && [ -x "$VENV_PYTHON" ]; then
+    if [ -d ".venv" ] && [ -x "$VENV_PYTHON" ] && "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
         echo -e "${GREEN}✅ .venv already exists — reusing${NC}"
     else
-        # A partial/broken .venv would break pip; recreate only in that case.
+        # A partial/broken/pip-less .venv would break installs; recreate it.
         [ -d ".venv" ] && rm -rf .venv
-        "$PY" -m venv .venv
+        if ! "$PY" -m venv .venv; then
+            echo -e "${RED}❌ Failed to create .venv.${NC}"
+            echo "   Install venv support and retry (sudo only if not root):"
+            echo "     apt install -y python3-venv python3-full"
+            exit 1
+        fi
+        # Guarantee pip exists inside the venv even on stripped interpreters.
+        "$VENV_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1 || true
         venv_fresh="1"
         echo -e "${GREEN}✅ Created .venv${NC}"
     fi
     echo ""
 
     # --- Install dependencies (only when fresh or requirements changed) ---
-    echo -e "${YELLOW}[4/6] Python dependencies...${NC}"
+    echo -e "${YELLOW}[4/7] Python dependencies...${NC}"
     local req_hash marker
     req_hash="$(_req_hash)"
     marker=".venv/.deps_ok"
@@ -265,14 +320,19 @@ cmd_setup() {
         echo -e "${GREEN}✅ Dependencies already up to date — skipping${NC}"
     else
         [ -n "$venv_fresh" ] && "$VENV_PYTHON" -m pip install --upgrade pip --quiet
-        "$VENV_PYTHON" -m pip install -r requirements.txt --quiet
-        echo "$req_hash" > "$marker"
-        echo -e "${GREEN}✅ Dependencies installed${NC}"
+        if install_requirements; then
+            echo "$req_hash" > "$marker"
+            echo -e "${GREEN}✅ Dependencies installed${NC}"
+        else
+            echo -e "${RED}❌ Failed to install dependencies.${NC}"
+            echo "   Last pip error:"; tail -5 /tmp/akaza_pip_err 2>/dev/null
+            exit 1
+        fi
     fi
     echo ""
 
     # --- Resolve credentials (env → existing .env → interactive prompt) ---
-    echo -e "${YELLOW}[5/6] Configuring credentials...${NC}"
+    echo -e "${YELLOW}[5/7] Configuring credentials...${NC}"
     local token admin current_token current_admin
     token="${BOT_TOKEN:-}"
     admin="${ADMIN_ID:-}"
@@ -313,8 +373,47 @@ EOF
     echo -e "${GREEN}✅ Saved to .env${NC}"
     echo ""
 
+    # --- Verify everything actually works before starting ---
+    echo -e "${YELLOW}[6/7] Verifying installation...${NC}"
+    if [ ! -x "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+        echo -e "${RED}❌ pip is not available inside .venv.${NC}"
+        echo "   Recreate it:  rm -rf .venv && bash setup.sh"
+        exit 1
+    fi
+
+    local missing
+    missing="$("$VENV_PYTHON" - <<'PYEOF'
+import importlib.util as u
+mods = ["pyrogram", "requests", "socks", "rarfile", "py7zr", "psutil"]
+print(" ".join(m for m in mods if u.find_spec(m) is None))
+PYEOF
+)"
+    if [ -n "$missing" ]; then
+        echo -e "${YELLOW}    Missing modules ($missing) — reinstalling dependencies...${NC}"
+        install_requirements || true
+        missing="$("$VENV_PYTHON" - <<'PYEOF'
+import importlib.util as u
+mods = ["pyrogram", "requests", "socks", "rarfile", "py7zr", "psutil"]
+print(" ".join(m for m in mods if u.find_spec(m) is None))
+PYEOF
+)"
+        if [ -n "$missing" ]; then
+            echo -e "${RED}❌ Still missing after reinstall: $missing${NC}"
+            echo "   Check the pip errors above (usually a network issue), then re-run."
+            exit 1
+        fi
+        echo "$req_hash" > "$marker"
+    fi
+
+    if "$VENV_PYTHON" "$BOT_SCRIPT" --selftest >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ Verified: venv + pip + dependencies + bot self-test all OK${NC}"
+    else
+        echo -e "${GREEN}✅ Verified: venv + pip + dependencies OK${NC}"
+    fi
+    echo ""
+
     # --- Start the bot in nohup mode (restart if already running) ---
-    echo -e "${YELLOW}[6/6] Starting bot in background (nohup mode)...${NC}"
+    echo -e "${YELLOW}[7/7] Starting bot in background (nohup mode)...${NC}"
     echo ""
 
     if is_running; then
