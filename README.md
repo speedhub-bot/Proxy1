@@ -32,13 +32,14 @@ bash setup.sh
 
 That's it. The script is **fully self-contained and idempotent** — run it on a
 brand-new server and it does everything itself. It will:
-1. ✅ Install Python 3 (+ `venv`) automatically **if it's missing** — on apt, dnf/yum, pacman, apk, or Termux. Already installed? It's left as-is (no upgrades).
+1. ✅ Install Python 3 **with working `venv` + `pip`** automatically if missing — on apt, dnf/yum, pacman, apk, or Termux. On Debian/Ubuntu this also pulls `python3-venv` / `python3-pip` (the pieces that cause the classic *"No module named pip"* / *"ensurepip is not available"* errors). Uses `sudo` only when you're not already root — plain `apt` works fine for root.
 2. ✅ Install `unrar` / `p7zip` automatically if missing (for `.rar` / `.7z` archives)
-3. ✅ Create the virtual environment (`.venv/`) — reused if it already exists
-4. ✅ Install all dependencies (pyrogram, tgcrypto, requests, rarfile, py7zr, ...) — skipped when already up to date
+3. ✅ Create the virtual environment (`.venv/`) — reused if it already exists, recreated if broken
+4. ✅ Install all dependencies (pyrogram, tgcrypto, requests, rarfile, py7zr, ...) — skipped when already up to date. If a package has no prebuilt wheel for your Python (e.g. `tgcrypto` on Python 3.13), it auto-installs a compiler + headers and builds it.
 5. ❓ Ask you to paste your `BOT_TOKEN` and `ADMIN_ID` (or read them from a `.env` file / environment variables)
 6. ✅ Save them to a `.env` file (you don't edit any code!)
-7. 🚀 Start the bot in the background with `nohup`
+7. ✅ **Verify** the install — confirms `pip` works in the venv and every required module imports, and re-installs anything missing before starting
+8. 🚀 Start the bot in the background with `nohup`
 
 Fully hands-off (no prompts) — provide the two values up front:
 ```bash
