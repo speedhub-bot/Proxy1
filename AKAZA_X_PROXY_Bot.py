@@ -411,9 +411,10 @@ PORT_RE   = r"\d{2,5}(?!\d)"
 USER_RE   = r"[A-Za-z0-9_\-\.]+"
 # Password/credential token: proxy passwords routinely contain almost any
 # printable symbol ({ } | & ! $ % etc.), so accept any run of non-space chars
-# that is not the "@" that delimits the credentials from the host. Anchored
-# full-line matching keeps this safe from grabbing junk.
-PASS_RE   = r"[^\s@]+"
+# EXCEPT "@" (delimits creds from host) and "/" (a "/" means the line is a URL
+# path, i.e. a ULP `https://site/path:user:pass` entry — NOT a proxy). Anchored
+# full-line matching plus these two exclusions keep junk out.
+PASS_RE   = r"[^\s@/]+"
 # Expanded scheme list — covers HTTP/HTTPS/SOCKS4/SOCKS4a/SOCKS5/SOCKS5h +
 # less common ones (quic, ssl, connect, ftp, ssh, proxy).  Unknown schemes
 # fall back to "http" in the classifier.
@@ -507,9 +508,9 @@ _AUTH_TOKEN = rf"(?:(?P<user>{USER_RE}):(?P<password>{PASS_RE})@)?"
 PROXY_PATTERNS = [
     rf"^(?P<scheme>{SCHEME_RE})://{_AUTH_TOKEN}(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
     rf"^(?P<user>{USER_RE}):(?P<password>{PASS_RE})@(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})$",
-    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE}):(?P<user>{USER_RE}):(?P<password>{PASS_RE})$",
-    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE})\|(?P<user>[^|\s]+)\|(?P<password>[^|\s]+)$",
-    rf"^(?P<host>{IPV4_RE}):(?P<port>{PORT_RE});(?P<user>[^;\s]+);(?P<password>[^;\s]+)$",
+    rf"^(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE}):(?P<user>{USER_RE}):(?P<password>[^\s/]+)$",
+    rf"^(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE})\|(?P<user>[^|\s]+)\|(?P<password>[^|\s]+)$",
+    rf"^(?P<host>{_HOST_TOKEN}):(?P<port>{PORT_RE});(?P<user>[^;\s]+);(?P<password>[^;\s]+)$",
     rf"^(?P<host>{_HOST_TOKEN})\|(?P<port>{PORT_RE})$",
     rf"^(?P<host>{_HOST_TOKEN}),(?P<port>{PORT_RE})(?:,(?P<user>[^,\s]+),(?P<password>[^,\s]+))?$",
     rf"^(?P<host>{_HOST_TOKEN})\t(?P<port>{PORT_RE})(?:\t(?P<user>[^\t\s]+)\t(?P<password>[^\t\s]+))?$",
@@ -559,6 +560,43 @@ COMMON_PROXY_PORTS = {
     8000, 8001, 8008, 8089, 8181, 8223, 8444, 8445, 8530, 8889, 9000, 9001,
 }
 BARE_PROXY_PORTS = COMMON_PROXY_PORTS - {80, 443}
+
+# Well-known ports for services that are NEVER HTTP/SOCKS proxies. Lines that
+# land on these are almost always ULP credential dumps for FTP/SSH/mail/DB
+# servers (e.g. "1.2.3.4:22:root:pass"), not proxies — reject them outright,
+# even when they carry user:pass credentials.
+NON_PROXY_PORTS = {
+    20, 21,          # FTP
+    22,              # SSH
+    23,              # Telnet
+    25, 465, 587,    # SMTP
+    53,              # DNS
+    67, 68,          # DHCP
+    69,              # TFTP
+    110, 995,        # POP3
+    143, 993,        # IMAP
+    123,             # NTP
+    135, 137, 138, 139, 445,   # NetBIOS / SMB / RPC
+    161, 162,        # SNMP
+    179,             # BGP
+    389, 636,        # LDAP
+    1433, 1434,      # MSSQL
+    1521,            # Oracle
+    2049,            # NFS
+    3306,            # MySQL
+    3389,            # RDP
+    5060, 5061,      # SIP
+    5432,            # PostgreSQL
+    5900, 5901,      # VNC
+    6379,            # Redis
+    9200,            # Elasticsearch
+    11211,           # Memcached
+    27017, 27018,    # MongoDB
+    2082, 2083,      # cPanel (http/https)
+    2086, 2087,      # WHM
+    2095, 2096,      # cPanel webmail
+    2077, 2078,      # cPanel WebDisk
+}
 
 # Reserved / private IP ranges that are almost never public proxies
 # (we still allow them, but flag as suspicious)
@@ -650,14 +688,15 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int,
         # Accept only on common proxy ports
         return port in COMMON_PROXY_PORTS
 
-    # 4. Bare ip:port (no scheme, or scheme defaulted to http by classifier)
-    # Apply STRICT filtering — this is where most trash comes from
-    # Reject if there are URL-like indicators
-    if any(x in line_lower for x in ("http://", "https://", "ftp://",
-                                      ".php", ".html", ".aspx", ".jsp",
-                                      "login", "password=", "user=", "session",
-                                      "cookie", "select ", "insert ",
-                                      "update ", "create ", "drop ",
+    # 4. No explicit scheme: bare host:port OR user:pass@host:port OR
+    #    host:port:user:pass. This is where most ULP trash comes from.
+    #
+    # HARD junk signals — a real proxy line NEVER contains a URL path ("/"),
+    # a nested scheme, a file extension, or SQL. These reject unconditionally.
+    if any(x in line_lower for x in ("http://", "https://", "ftp://", "://",
+                                      "/", ".php", ".html", ".aspx", ".jsp",
+                                      "password=", "user=", "select ",
+                                      "insert ", "update ", "drop ",
                                       "where ", "from ", "table ",
                                       "mailto:", "javascript:", "data:")):
         return False
@@ -666,17 +705,22 @@ def _looks_like_proxy_line(line: str, scheme: str, host: str, port: int,
     if _is_private_ip(host):
         return False
 
-    # An authenticated line (user:pass@host:port) is unambiguous proxy
-    # credentials — real auth proxies routinely use non-standard ports
-    # (e.g. 10780). Accept on ANY valid port, only guarding against lines
-    # that look like logs (handled below via the token/marker checks).
+    # An authenticated line (user:pass@host:port or host:port:user:pass) is
+    # strong proxy evidence — real auth proxies use non-standard ports (10780,
+    # 12321, ...) and their credentials legitimately contain words like
+    # "session"/"country"/"zone" (residential-proxy syntax), so we do NOT apply
+    # the credential-word ULP filter here. Port sanity is enforced in
+    # _classify_proxy. Only reject log-like lines with many tokens.
     if has_auth:
-        if len(line_stripped.split()) > 6:
-            return False
-        return True
+        return len(line_stripped.split()) <= 6
 
-    # Bare host:port with NO auth — stay strict: require a known proxy port so
-    # ULP noise like "example.com:443" is not treated as a proxy.
+    # Bare host:port with NO auth — much weaker signal, stay strict:
+    # reject credential/ULP keywords and require a known proxy port so noise
+    # like "example.com:443" or "site.com:8080/login" is not treated as a proxy.
+    if any(x in line_lower for x in ("login", "signin", "signup", "session",
+                                     "cookie", "account", "register",
+                                     "auth", "create ")):
+        return False
     if port not in BARE_PROXY_PORTS:
         return False
 
@@ -706,6 +750,29 @@ def _classify_proxy(scheme: str, host: str, port: str,
         return None
     if not (_valid_ipv4(host) or _valid_ipv6(host)
             or re.match(rf"^{HOST_RE}$", host)):
+        return None
+
+    # Port sanity: proxies live on high-ish ports. Ports < 80 are ULP noise
+    # (e.g. "windscribe.com:4:signup:pass" — ":4" is not a real proxy port),
+    # and well-known service/cPanel ports (FTP/SSH/mail/DB/cPanel) are leaked
+    # logins, not proxies (e.g. "1.2.3.4:22:root:pass").
+    try:
+        port_num = int(port)
+    except Exception:
+        return None
+    if port_num < 80 or port_num in NON_PROXY_PORTS:
+        return None
+
+    # Reject loopback hosts — never a public proxy.
+    if str(host).lower() in ("localhost", "127.0.0.1", "::1"):
+        return None
+
+    # The username of a proxy is a credential, not a network locator. In ULP
+    # dumps the "URL host" gets misread as the username (e.g.
+    # "https://www.netflix.com:email@orange.fr:2203" → user="www.netflix.com"),
+    # so reject when the username is itself an IP or a full domain.
+    if username and (_valid_ipv4(username)
+                     or re.fullmatch(rf"{HOST_RE}", username)):
         return None
 
     scheme = (scheme or "").lower()
@@ -767,6 +834,11 @@ def extract_proxies_from_lines(lines_iterable: Iterable[str], strict: bool = Tru
         elif candidate.startswith("[") and candidate.endswith("]") and candidate.count(":") == 1:
             candidate = candidate[1:-1].strip()
         if not candidate:
+            continue
+
+        # A single proxy never contains two "://" — a second scheme means the
+        # line is a nested URL from a ULP dump (e.g. "http://android://...").
+        if candidate.count("://") > 1:
             continue
 
         # Every accepted token must span the complete normalized line.
@@ -847,6 +919,14 @@ def run_filter_selftest() -> bool:
         "purevpn0s7418668:hkoerprqpmtz@px022409.pointtoserver.com:10780",
         "purevpn0s13289443:4C5BS}S8pW&YK8@px014004.pointtoserver.com:10780",
         "user123:P4ss|word&{x}$@proxy.example.com:31280",
+        # Residential-provider proxies: hostname:port:user:pass on custom ports,
+        # credentials containing "session"/"country"/"zone" words.
+        "geo.iproyal.com:12321:eunC8pGYtdXnVQsA:WykMYfKrD7dOStCh_country-sk",
+        "gate.decodo.com:7000:user-sp9az8-country-us-session-1:kwUMed36iFlT",
+        "brd.superproxy.io:33335:brd-customer-hl_f628e70d-zone-isp_proxy1:3uw22vp41cbs",
+        # host:port:user:pass where the password contains "@" (no "@" delimiter
+        # in this format, so it is a legit password char).
+        "proxy.rkv.rgukt.in:3128:R121142:SIV@JAARAM",
     ]
     negative = [
         "https://site.com/login.php:user:pass",
@@ -857,6 +937,15 @@ def run_filter_selftest() -> bool:
         "email@x.com:password",
         # Bare domain on a non-standard port WITHOUT credentials stays trash.
         "px014004.pointtoserver.com:10780",
+        # Nonsense sub-80 "port" from a ULP line — not a real proxy.
+        "windscribe.com:4:signup:BogdaFa",
+        "www.meritnation.com:9:ask-answer:question",
+        # cPanel login dump — port 2083 is not a proxy.
+        "cp-in-10.webhostbox.net:2083:westedyu:g5xM8jLr",
+        # Leaked SSH login — port 22 is not a proxy.
+        "1.2.3.4:22:root:hunter2",
+        # ULP URL with a path (has "/") even though it ends in :port.
+        "site.com:8080/login:user:pass",
     ]
     failures = []
     for sample in positive:
